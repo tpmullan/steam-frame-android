@@ -336,6 +336,9 @@ cmd_start() {
 #                   when Android's init starts, init's keychord watcher opens
 #                   each new FIFO read-only and blocks forever (boot hangs).
 #   wgapps-battery  the Frame's battery -> Android's BatteryService.
+#   wgapps-clipboard  Android's clipboard <-> gamescope's X11 clipboard,
+#                   served as Waydroid's clipboard HIDL service over the
+#                   container's hwbinder (libgbinder from lib/).
 start_helpers() {
 	local pid
 	stop_helpers
@@ -343,6 +346,7 @@ start_helpers() {
 	[[ -n "$pid" && "$pid" != 0 ]] || return 0
 	start_helper wgapps-pad "/proc/$pid/root/dev/input/wl_keyboard_events"
 	start_helper wgapps-battery
+	start_helper wgapps-clipboard
 }
 
 start_helper() {
@@ -355,7 +359,7 @@ start_helper() {
 
 stop_helpers() {
 	local name pid
-	for name in wgapps-pad wgapps-battery; do
+	for name in wgapps-pad wgapps-battery wgapps-clipboard; do
 		pid="$(cat "$RUNDIR/$name.pid" 2>/dev/null || true)"
 		if [[ -n "$pid" ]] && grep -q "$name" "/proc/$pid/cmdline" 2>/dev/null; then
 			kill "$pid" 2>/dev/null || true

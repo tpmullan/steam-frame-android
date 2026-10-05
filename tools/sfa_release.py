@@ -39,6 +39,7 @@ REQUIRED_FILES = (
     "wgapps/bin/wgapps",
     "wgapps/bin/wgapps-pad",
     "wgapps/bin/wgapps-battery",
+    "wgapps/bin/wgapps-clipboard",
     "wgapps/bin/wgapps-ota",
     "wgapps/bin/wgapps-gen-overrides",
     "wgapps/bin/steam-shortcuts.py",

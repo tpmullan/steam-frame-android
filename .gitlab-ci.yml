@@ -31,7 +31,7 @@ variables:
     bin/wgapps bin/fetch-images.sh tools/deploy.sh tools/build-image.sh
     tools/build-libgbinder.sh overrides/system/etc/wgapps-net.sh
   PY_FILES: >-
-    bin/wgapps-pad bin/wgapps-battery bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
+    bin/wgapps-pad bin/wgapps-battery bin/wgapps-clipboard bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
     tools/sfa_release.py tests
 
 # --- lint and tests --------------------------------------------------------
