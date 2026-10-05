@@ -326,31 +326,42 @@ cmd_start() {
 
 	log "starting $NAME (headless=$headless)"
 	podman "${ARGS[@]}" >/dev/null
-	start_pad
+	start_helpers
 }
 
-# Steam's virtual Xbox pad -> Android remote keys (see wgapps-pad). The
-# forwarder reaches Waydroid's keyboard FIFO through the container's /proc
-# root. Do not mount /dev/input from the host: if /dev/input exists when
-# Android's init starts, its keychord watcher opens each new FIFO read-only
-# and blocks forever, which hangs boot.
-start_pad() {
+# Host-side helpers that run alongside Android and stop with it:
+#   wgapps-pad      Steam's virtual Xbox pad -> Android remote keys. Reaches
+#                   Waydroid's keyboard FIFO through the container's /proc
+#                   root. Do not mount /dev/input from the host: if it exists
+#                   when Android's init starts, init's keychord watcher opens
+#                   each new FIFO read-only and blocks forever (boot hangs).
+#   wgapps-battery  the Frame's battery -> Android's BatteryService.
+start_helpers() {
 	local pid
-	stop_pad
+	stop_helpers
 	pid="$(podman inspect -f '{{.State.Pid}}' "$NAME" 2>/dev/null || true)"
 	[[ -n "$pid" && "$pid" != 0 ]] || return 0
-	setsid /usr/bin/python3 "$BIN/wgapps-pad" "/proc/$pid/root/dev/input/wl_keyboard_events" \
-		>>"$RUNDIR/pad.log" 2>&1 </dev/null &
-	echo $! >"$RUNDIR/pad.pid"
+	start_helper wgapps-pad "/proc/$pid/root/dev/input/wl_keyboard_events"
+	start_helper wgapps-battery
 }
 
-stop_pad() {
-	local pid
-	pid="$(cat "$RUNDIR/pad.pid" 2>/dev/null || true)"
-	if [[ -n "$pid" ]] && grep -q wgapps-pad "/proc/$pid/cmdline" 2>/dev/null; then
-		kill "$pid" 2>/dev/null || true
-	fi
-	rm -f "$RUNDIR/pad.pid"
+start_helper() {
+	local name="$1"
+	shift
+	WGAPPS_CONTAINER="$NAME" setsid /usr/bin/python3 "$BIN/$name" "$@" \
+		>>"$RUNDIR/$name.log" 2>&1 </dev/null &
+	echo $! >"$RUNDIR/$name.pid"
+}
+
+stop_helpers() {
+	local name pid
+	for name in wgapps-pad wgapps-battery; do
+		pid="$(cat "$RUNDIR/$name.pid" 2>/dev/null || true)"
+		if [[ -n "$pid" ]] && grep -q "$name" "/proc/$pid/cmdline" 2>/dev/null; then
+			kill "$pid" 2>/dev/null || true
+		fi
+		rm -f "$RUNDIR/$name.pid"
+	done
 }
 
 cmd_stop() {
@@ -366,7 +377,7 @@ cmd_stop() {
 		kill "$waiter" 2>/dev/null || true
 	fi
 	podman rm -f "$NAME" >/dev/null 2>&1 || true
-	stop_pad
+	stop_helpers
 	log "stopped"
 }
 
@@ -581,10 +592,10 @@ cmd_update() {
 	[[ -f "$stage/bin/wgapps" ]] || die "image $ref has no bin/wgapps"
 	rm -rf "$prev"
 	mkdir -p "$prev"
-	for item in bin overrides VERSION image; do
+	for item in bin lib overrides VERSION image; do
 		if [[ -e "$BASE/$item" ]]; then mv "$BASE/$item" "$prev/"; fi
 	done
-	for item in bin overrides VERSION; do
+	for item in bin lib overrides VERSION; do
 		if [[ -e "$stage/$item" ]]; then mv "$stage/$item" "$BASE/"; fi
 	done
 	chmod 0755 "$BASE"/bin/*
@@ -597,7 +608,7 @@ cmd_update() {
 cmd_rollback() {
 	local prev="$BASE/.previous" item
 	[[ -f "$prev/bin/wgapps" ]] || die "nothing to roll back to"
-	for item in bin overrides VERSION image; do
+	for item in bin lib overrides VERSION image; do
 		rm -rf "${BASE:?}/$item"
 		if [[ -e "$prev/$item" ]]; then mv "$prev/$item" "$BASE/"; fi
 	done

@@ -13,6 +13,7 @@
 stages:
   - lint
   - test
+  - deps
   - build
 
 workflow:
@@ -28,9 +29,9 @@ variables:
   PUBLIC_IMAGE: ghcr.io/tpmullan/steam-frame-android
   SHELL_FILES: >-
     bin/wgapps bin/fetch-images.sh tools/deploy.sh tools/build-image.sh
-    overrides/system/etc/wgapps-net.sh
+    tools/build-libgbinder.sh overrides/system/etc/wgapps-net.sh
   PY_FILES: >-
-    bin/wgapps-pad bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
+    bin/wgapps-pad bin/wgapps-battery bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
     tools/sfa_release.py tests
 
 # --- lint and tests --------------------------------------------------------
@@ -64,15 +65,33 @@ unit-tests:
 
 # --- build ---------------------------------------------------------------
 
-# A FROM scratch image of plain files: no emulation is needed to build the
-# arm64 variant on the amd64 runners (no RUN steps).
+# libgbinder for the host-side clipboard service, built natively on the arm64
+# runners from pinned tarballs (tools/libgbinder.env). Its log shows the
+# architecture, soname and dependencies of the result.
+libgbinder:
+  stage: deps
+  image: debian:bookworm-slim
+  needs: []
+  script:
+    - apt-get update -qq
+    - >-
+      apt-get install -y -qq --no-install-recommends
+      build-essential pkg-config libglib2.0-dev curl ca-certificates >/dev/null
+    - tools/build-libgbinder.sh lib
+  artifacts:
+    paths:
+      - lib/
+    expire_in: 30 days
+
+# The release image is a FROM scratch bundle of files built on the arm64
+# runners (COPY only, no RUN steps).
 .build:
   stage: build
   image: docker:27.5.1
   services:
     - name: docker:27.5.1-dind
       alias: docker
-  needs: [shellcheck, shfmt, ruff, unit-tests]
+  needs: [shellcheck, shfmt, ruff, unit-tests, libgbinder]
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""

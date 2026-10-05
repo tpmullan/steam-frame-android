@@ -38,6 +38,7 @@ DEFAULT_DENY = pathlib.Path.home() / ".config/steam-frame-android/release-deny"
 REQUIRED_FILES = (
     "wgapps/bin/wgapps",
     "wgapps/bin/wgapps-pad",
+    "wgapps/bin/wgapps-battery",
     "wgapps/bin/wgapps-ota",
     "wgapps/bin/wgapps-gen-overrides",
     "wgapps/bin/steam-shortcuts.py",
@@ -45,6 +46,9 @@ REQUIRED_FILES = (
     "wgapps/VERSION",
     "wgapps/LICENSE",
     "wgapps/overrides/system/etc/init/z_wgapps.rc",
+    "wgapps/lib/libgbinder.so.1",
+    "wgapps/lib/licenses/libgbinder.LICENSE",
+    "wgapps/lib/licenses/libglibutil.LICENSE",
 )
 # Android/Google artifacts and files generated from Waydroid's vendor image
 # must never ship.

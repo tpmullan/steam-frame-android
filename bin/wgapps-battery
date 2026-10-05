@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Mirror the Steam Frame's battery into Android.
+
+Waydroid's health HAL reports a fixed battery (85 %, charging, 35 C), so
+Android shows nothing real. This reads the host's power supplies from
+sysfs and pushes the values into Android's BatteryService with
+`cmd battery set` (Android 13 accepts ac, usb, wireless, status, level,
+counter, temp, present, invalid). The first `set` stops the HAL's updates;
+`cmd battery reset` hands control back.
+
+Supplies are found by their sysfs `type` (Battery, Mains, USB*, Wireless),
+not by device-specific names.
+
+Usage: wgapps-battery [--interval SECONDS] [--once]
+Environment: WGAPPS_CONTAINER (default waydroid-gapps)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+POWER_SUPPLY = pathlib.Path("/sys/class/power_supply")
+
+# android.os.BatteryManager.BATTERY_STATUS_*
+STATUS = {
+    "Unknown": 1,
+    "Charging": 2,
+    "Discharging": 3,
+    "Not charging": 4,
+    "Full": 5,
+}
+
+
+def log(msg: str) -> None:
+    print(time.strftime("%F %T"), "wgapps-battery:", msg, file=sys.stderr, flush=True)
+
+
+def _read(path: pathlib.Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def _read_int(path: pathlib.Path) -> int | None:
+    value = _read(path)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def read_host(root: pathlib.Path = POWER_SUPPLY) -> dict:
+    """Host power state: battery level/status/temp and online chargers."""
+    state = {"battery": None, "ac": False, "usb": False, "wireless": False}
+    if not root.is_dir():
+        return state
+    for supply in sorted(root.iterdir()):
+        kind = _read(supply / "type") or ""
+        online = _read_int(supply / "online") == 1
+        if kind == "Battery" and state["battery"] is None:
+            capacity = _read_int(supply / "capacity")
+            if capacity is None:
+                continue
+            state["battery"] = {
+                "level": max(0, min(100, capacity)),
+                "status": _read(supply / "status") or "Unknown",
+                # power_supply temp is in tenths of a degree Celsius.
+                "temp": _read_int(supply / "temp"),
+                # charge_counter is in uAh.
+                "counter": _read_int(supply / "charge_counter"),
+            }
+        elif kind == "Mains":
+            state["ac"] |= online
+        elif kind.startswith("USB"):
+            state["usb"] |= online
+        elif kind == "Wireless":
+            state["wireless"] |= online
+    return state
+
+
+def to_android(state: dict) -> dict[str, int]:
+    """BatteryService `set` values for a host state (empty if no battery)."""
+    battery = state["battery"]
+    if battery is None:
+        return {}
+    values = {
+        "present": 1,
+        "level": battery["level"],
+        "status": STATUS.get(battery["status"], STATUS["Unknown"]),
+        "ac": int(state["ac"]),
+        "usb": int(state["usb"]),
+        "wireless": int(state["wireless"]),
+    }
+    if battery["temp"] is not None:
+        values["temp"] = battery["temp"]
+    if battery["counter"] is not None:
+        values["counter"] = battery["counter"]
+    return values
+
+
+def changes(previous: dict[str, int], current: dict[str, int]) -> dict[str, int]:
+    return {k: v for k, v in current.items() if previous.get(k) != v}
+
+
+def command(values: dict[str, int]) -> str:
+    """One shell line setting all values; level last so listeners see a
+    consistent state when the level broadcast arrives."""
+    keys = sorted(values, key=lambda k: (k == "level", k))
+    return "; ".join(f"cmd battery set {k} {int(values[k])}" for k in keys)
+
+
+def android_exec(container: str, script: str) -> bool:
+    res = subprocess.run(
+        ["podman", "exec", container, "/system/bin/sh", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        log(f"podman exec failed ({res.returncode}): {res.stderr.strip()}")
+    return res.returncode == 0
+
+
+def _stop(signum, frame) -> None:
+    # wgapps stops helpers with SIGTERM; unwind through main's finally block.
+    raise KeyboardInterrupt
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(description="Mirror the host battery into Android")
+    p.add_argument("--interval", type=float, default=30.0)
+    p.add_argument("--once", action="store_true")
+    a = p.parse_args(argv)
+    container = os.environ.get("WGAPPS_CONTAINER", "waydroid-gapps")
+    signal.signal(signal.SIGTERM, _stop)
+
+    pushed: dict[str, int] = {}
+    try:
+        while True:
+            current = to_android(read_host())
+            delta = changes(pushed, current)
+            if delta and android_exec(container, command(delta)):
+                pushed.update(delta)
+                log(f"set {delta}")
+            if a.once:
+                return 0
+            time.sleep(a.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if pushed and not a.once:
+            android_exec(container, "cmd battery reset")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
