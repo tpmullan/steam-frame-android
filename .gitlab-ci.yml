@@ -40,7 +40,7 @@ shellcheck:
   stage: lint
   image: koalaman/shellcheck-alpine:v0.10.0
   script:
-    - shellcheck $SHELL_FILES
+    - shellcheck -x $SHELL_FILES
 
 shfmt:
   stage: lint

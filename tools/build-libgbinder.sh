@@ -30,8 +30,11 @@ fetch() { # name repo version sha256
 fetch glibutil sailfishos/libglibutil "$GLIBUTIL_VERSION" "$GLIBUTIL_SHA256"
 fetch gbinder mer-hybris/libgbinder "$GBINDER_VERSION" "$GBINDER_SHA256"
 
+glibutil="$src/libglibutil-$GLIBUTIL_VERSION"
+# RELEASE_LIBS names the static archive: with -lglibutil the linker would
+# pick libglibutil.so and the result would need a library SteamOS lacks.
 make -C "$src/libgbinder-$GBINDER_VERSION" -j"$(nproc)" \
-	LIBGLIBUTIL_PATH="$src/libglibutil-$GLIBUTIL_VERSION" release
+	LIBGLIBUTIL_PATH="$glibutil" RELEASE_LIBS="$glibutil/build/release/libglibutil.a" release
 
 mkdir -p "$out/licenses"
 lib="$out/libgbinder.so.1"
