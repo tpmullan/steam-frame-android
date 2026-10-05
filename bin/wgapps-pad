@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Forward Steam's virtual Xbox pad into Android as remote-control keys.
+
+Steam Input exposes the Frame controllers to the running Steam app as a
+virtual "Microsoft X-Box 360 pad". Android in the container cannot open host
+input devices (its input reader runs as a non-root Android UID), and Steam's
+keyboard bindings go to X11, which the Android window does not use. Waydroid's
+input HAL reads Linux input events from FIFOs under Android's /dev/input.
+This forwarder writes key events into the keyboard FIFO, which wgapps passes
+as a /proc/<container pid>/root path.
+
+Steam recreates the virtual pad when the focused app changes, so the pad is
+looked up by name and reattached.
+
+Usage: wgapps-pad <path to wl_keyboard_events FIFO>
+"""
+
+import errno
+import os
+import re
+import select
+import struct
+import sys
+import time
+
+PAD_NAME = "X-Box 360 pad"
+EVENT = struct.Struct("llHHi")
+EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
+ABS_HAT0X, ABS_HAT0Y = 0x10, 0x11
+
+# Linux key codes that Android's Generic.kl maps to TV-remote keys.
+KEY_SELECT = 353  # DPAD_CENTER
+KEY_BACK = 158  # BACK
+KEY_PLAYPAUSE = 164  # MEDIA_PLAY_PAUSE
+KEY_REWIND = 168  # MEDIA_REWIND
+KEY_FASTFORWARD = 208  # MEDIA_FAST_FORWARD
+KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT = 103, 108, 105, 106
+
+BUTTONS = {
+    0x130: KEY_SELECT,  # BTN_SOUTH (A)
+    0x131: KEY_BACK,  # BTN_EAST (B)
+    0x133: KEY_PLAYPAUSE,  # BTN_NORTH (X on the xpad driver)
+    0x136: KEY_REWIND,  # BTN_TL (left bumper)
+    0x137: KEY_FASTFORWARD,  # BTN_TR (right bumper)
+}
+HATS = {
+    ABS_HAT0X: (KEY_LEFT, KEY_RIGHT),
+    ABS_HAT0Y: (KEY_UP, KEY_DOWN),
+}
+
+
+def log(msg):
+    print(time.strftime("%F %T"), "wgapps-pad:", msg, file=sys.stderr, flush=True)
+
+
+def find_pads():
+    try:
+        text = open("/proc/bus/input/devices").read()
+    except OSError:
+        return []
+    pads = []
+    for block in text.split("\n\n"):
+        if PAD_NAME in block:
+            m = re.search(r"\bevent(\d+)\b", block)
+            if m:
+                pads.append("/dev/input/event" + m.group(1))
+    return pads
+
+
+class Sink:
+    """Writes key events to the FIFO; reopens it when Android restarts."""
+
+    def __init__(self, path):
+        self.path = path
+        self.fd = None
+
+    def _open(self):
+        try:
+            self.fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as e:
+            if e.errno not in (errno.ENOENT, errno.ENXIO):
+                log(f"cannot open {self.path}: {e}")
+            self.fd = None
+
+    def key(self, code, value):
+        if self.fd is None:
+            self._open()
+            if self.fd is None:
+                return
+        now = time.time()
+        sec, usec = int(now), int((now % 1) * 1e6)
+        data = EVENT.pack(sec, usec, EV_KEY, code, value) + EVENT.pack(sec, usec, EV_SYN, 0, 0)
+        try:
+            os.write(self.fd, data)  # 48 bytes < PIPE_BUF: atomic
+        except OSError as e:
+            if e.errno != errno.EAGAIN:
+                os.close(self.fd)
+                self.fd = None
+
+
+def translate(etype, code, value, hat):
+    """Map one pad event to Android key events; updates hat state in place."""
+    if etype == EV_KEY and code in BUTTONS and value in (0, 1):
+        return [(BUTTONS[code], value)]
+    if etype != EV_ABS or code not in HATS:
+        return []
+    neg, pos = HATS[code]
+    old = hat.get(code, 0)
+    if old == value:
+        return []
+    out = []
+    if old < 0:
+        out.append((neg, 0))
+    elif old > 0:
+        out.append((pos, 0))
+    if value < 0:
+        out.append((neg, 1))
+    elif value > 0:
+        out.append((pos, 1))
+    hat[code] = value
+    return out
+
+
+def main(argv):
+    if len(argv) != 2:
+        sys.exit(__doc__)
+    sink = Sink(argv[1])
+    pads = {}  # path -> file
+    hat = {}
+    while True:
+        for path in find_pads():
+            if path not in pads:
+                try:
+                    pads[path] = open(path, "rb", buffering=0)
+                    log(f"attached {path}")
+                except OSError as e:
+                    log(f"cannot open {path}: {e}")
+        if not pads:
+            time.sleep(0.5)
+            continue
+        ready, _, _ = select.select(list(pads.values()), [], [], 0.5)
+        for f in ready:
+            try:
+                data = f.read(EVENT.size * 64)
+            except OSError:
+                data = b""
+            if not data:
+                path = next(p for p, v in pads.items() if v is f)
+                log(f"detached {path}")
+                f.close()
+                del pads[path]
+                continue
+            for i in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, etype, code, value = EVENT.unpack_from(data, i)
+                for key, val in translate(etype, code, value, hat):
+                    sink.key(key, val)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except KeyboardInterrupt:
+        pass

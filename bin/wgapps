@@ -1,0 +1,611 @@
+#!/bin/bash
+# wgapps: run the Waydroid LineageOS 20 GAPPS image in rootless podman on the
+# Steam Frame. Everything lives under $HOME so SteamOS updates keep it.
+# https://github.com/tpmullan/steam-frame-android (see README.md).
+set -euo pipefail
+
+# Steam injects its overlay into everything it launches via LD_PRELOAD, which
+# breaks podman's helpers (pasta exits, so Android gets no network). Lepton's
+# launcher clears it the same way.
+export LD_PRELOAD=
+unset LD_LIBRARY_PATH
+
+BASE="${WGAPPS_BASE:-$HOME/.local/share/waydroid-gapps}"
+ROOTFS="$BASE/rootfs"
+DATA="$BASE/data"
+RUNDIR="$BASE/run"
+SHARE="$BASE/share"
+BIN="$BASE/bin"
+NAME="waydroid-gapps"
+DEFAULT_IMAGE="ghcr.io/tpmullan/steam-frame-android"
+ADB_PORT="${WGAPPS_ADB_PORT:-5556}"
+HOST_UID="$(id -u)"
+XDG="/run/user/$HOST_UID"
+WAYLAND_SOCKET="${WGAPPS_WAYLAND_SOCKET:-$XDG/gamescope-0}"
+
+log() { printf '%s wgapps: %s\n' "$(date '+%F %T')" "$*" >&2; }
+die() {
+	log "$*"
+	exit 1
+}
+
+usage() {
+	cat <<EOF
+usage: wgapps <command> [args]
+  install              check prerequisites, download Waydroid's GAPPS images from
+                       Waydroid, extract them, add the Android Steam shortcut
+  update [tag|ref]     replace these scripts and overrides with a released image
+                       (default: latest); Android data is not touched
+  rollback             undo the last update
+  uninstall [--yes]    stop Android, remove Steam shortcuts, delete everything
+                       under $BASE (Android data included)
+  version              installed release
+  gsf-id               print the GSF ID to register at google.com/android/uncertified
+  prepare [--force]    extract images/*.img into rootfs
+  start [--headless]   boot Android (display on gamescope unless --headless)
+  stop                 shut the container down
+  status               container state and boot progress
+  wait-boot [secs]     block until sys.boot_completed=1 (default 180s)
+  sh [cmd...]          run a command (or shell) inside Android as root
+  logcat [args...]     Android logcat
+  launch <package>     start or reuse Android, open the package's launcher activity
+  run <package>        launch, then block until the app's process exits
+  steam [package]      Steam shortcut entry point: (re)start Android under Steam's
+                       reaper so gamescope ties the window to the Steam app, open
+                       the package if given, block until Steam quits it
+EOF
+}
+
+running() {
+	[[ "$(podman inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" == "true" ]]
+}
+
+asys() {
+	podman exec "$NAME" /system/bin/sh -c "$*"
+}
+
+write_props() {
+	local headless="$1" tz
+	tz="$(readlink /etc/localtime)"
+	tz="${tz#/usr/share/zoneinfo/}"
+	mkdir -p "$RUNDIR"
+	{
+		echo "sys.use_memfd=true"
+		echo "bpf.progs_loaded=1"
+		echo "ro.cold_boot_done=true"
+		echo "ro.vndk.lite=true"
+		echo "ro.opengles.version=196609"
+		echo "ro.sf.lcd_density=${WGAPPS_DENSITY:-240}"
+		echo "ro.hardware.egl=mesa"
+		echo "ro.hardware.vulkan=freedreno"
+		echo "ro.hardware.gralloc=minigbm_gbm_mesa"
+		echo "ro.hardware.camera=v4l"
+		echo "config.disable_cameraservice=true"
+		# Codec2 input buffers default to the ION/DMA-BUF heap, but the host's
+		# /dev/dma_heap/system is root-only. Add the BLOB allocator (gralloc)
+		# to the default ION|BUFFERQUEUE mask: (1<<16)|(1<<18)|(1<<19).
+		echo "debug.stagefright.c2-poolmask=851968"
+		echo "waydroid.host.user=$(id -un)"
+		echo "waydroid.host.uid=$HOST_UID"
+		echo "waydroid.host.gid=$(id -g)"
+		echo "waydroid.xdg_runtime_dir=/waydroid/xdg"
+		echo "waydroid.pulse_runtime_path=/waydroid/xdg/pulse"
+		echo "waydroid.stub_sensors_hal=1"
+		# The Frame pointer arrives as a Wayland mouse; treat it as touch in every
+		# app so launcher and system gestures (swipe up for apps) work.
+		echo "persist.waydroid.fake_touch=${WGAPPS_FAKE_TOUCH:-*}"
+		echo "waydroid.wayland_display=wayland-0"
+		if [[ "$headless" == "true" ]]; then
+			echo "waydroid.background_start=true"
+		else
+			echo "waydroid.background_start=false"
+		fi
+		echo "persist.sys.timezone=$tz"
+		echo "service.adb.tcp.port=$ADB_PORT"
+		if [[ -f "$BASE/device.prop" ]]; then
+			cat "$BASE/device.prop"
+		fi
+	} >"$RUNDIR/waydroid.prop"
+	# Android init refuses group-writable property files.
+	chmod 0644 "$RUNDIR/waydroid.prop"
+}
+
+cmd_prepare() {
+	local img="$BASE/images"
+	[[ -f "$img/system.img" && -f "$img/vendor.img" ]] || die "missing $img/{system,vendor}.img"
+	if running; then
+		die "stop the container first"
+	fi
+	[[ -f "$img/DONE" ]] || die "images not downloaded yet (wgapps install)"
+	if [[ "${1:-}" == "--force" || ! -d "$ROOTFS/system" ]]; then
+		local tmp="$BASE/rootfs.new"
+		podman unshare rm -rf "$tmp"
+		mkdir -p "$tmp"
+		log "extracting system.img and vendor.img"
+		podman unshare sh -c '
+			set -e
+			debugfs -R "rdump / $1" "$2/system.img" >/dev/null 2>&1
+			rm -rf "$1/vendor"
+			mkdir "$1/vendor.new"
+			debugfs -R "rdump / $1/vendor.new" "$2/vendor.img" >/dev/null 2>&1
+			mv "$1/vendor.new" "$1/vendor"
+		' sh "$tmp" "$img"
+		podman unshare rm -rf "$ROOTFS"
+		mv "$tmp" "$ROOTFS"
+		rm -rf "$BASE/overrides-generated"
+	fi
+	generate_overrides
+	log "rootfs ready at $ROOTFS"
+}
+
+# Fixes that edit files from Waydroid's vendor image are generated from the
+# user's own extracted image (see wgapps-gen-overrides), never shipped.
+generate_overrides() {
+	local out="$BASE/overrides-generated"
+	[[ -d "$out" ]] && return 0
+	rm -rf "$out.new"
+	python3 "$BIN/wgapps-gen-overrides" "$ROOTFS" "$out.new" >&2 ||
+		die "cannot generate overrides from $ROOTFS"
+	mv "$out.new" "$out"
+}
+
+NET_SUBNET=172.20.0
+NET_ADDR="$NET_SUBNET.2"
+
+# Rootless podman has 65,537 IDs: the host user (intermediate 0) plus the
+# 65,536 subordinate IDs (intermediate 1..65536). Android needs app UIDs up
+# to 19999 and isolated-process UIDs 90000-99999 (WebView and Chrome
+# renderers), plus shared app GIDs 50000-59999, so map only the ranges it
+# uses. Container root is the host user, which owns the gamescope and
+# PulseAudio sockets.
+IDMAP=(
+	--uidmap 0:0:1 --uidmap 1:1:19999 --uidmap 90000:20000:10000
+	--gidmap 0:0:1 --gidmap 1:1:39999 --gidmap 50000:40000:10000 --gidmap 90000:50000:10000
+)
+IDMAP_VERSION=2
+
+# Data created under the earlier contiguous mapping (container ID ==
+# intermediate ID) has shared app GIDs 50000-59999 at intermediate
+# 50000-59999; under IDMAP those are intermediate 40000-49999. Runs inside
+# `podman unshare`.
+migrate_data_ids() {
+	local data="$1" f gid
+	while IFS= read -r -d '' f; do
+		gid="$(stat -c %g "$f")"
+		chown -h ":$((gid - 10000))" "$f"
+	done < <(find "$data" -xdev -gid +49999 -gid -60000 -print0)
+}
+
+ensure_idmap() {
+	local marker="$BASE/.idmap-version"
+	[[ "$(cat "$marker" 2>/dev/null)" == "$IDMAP_VERSION" ]] && return 0
+	if [[ -d "$DATA" && -n "$(ls -A "$DATA" 2>/dev/null)" ]]; then
+		log "migrating Android data to ID map v$IDMAP_VERSION"
+		podman unshare "$0" _migrate-ids "$DATA"
+	fi
+	echo "$IDMAP_VERSION" >"$marker"
+}
+
+bind() {
+	local src="$1" dst="$2" opt="${3:-rw}"
+	[[ -e "$src" ]] || return 0
+	ARGS+=(--mount "type=bind,source=$src,destination=$dst,$opt")
+}
+
+cmd_start() {
+	local headless=false
+	[[ "${1:-}" == "--headless" ]] && headless=true
+	[[ -d "$ROOTFS/system" ]] || die "no rootfs at $ROOTFS (run: wgapps prepare)"
+	if running; then
+		log "already running"
+		return 0
+	fi
+	podman rm -f "$NAME" >/dev/null 2>&1 || true
+	mkdir -p "$DATA" "$SHARE"
+	ensure_idmap
+	generate_overrides
+	write_props "$headless"
+
+	local seccomp="$BASE/lepton.seccomp.json"
+	# Hostname and hosts file as on stock Android: podman's generated
+	# /etc/hosts would hide /system/etc/hosts and map the hostname to the
+	# pasta address, so apps that bind "this device" (Plex's offline
+	# download server) listen on 172.20.0.2 while clients dial localhost.
+	ARGS=(
+		run -d --replace --name "$NAME" --hostname localhost --no-hosts
+		--env-host=false --init=false --env-file /dev/null
+		"${IDMAP[@]}" --user 0:0 --group-add keep-groups
+		--pid=private --ipc=private --uts=private --cgroupns=private
+		--cap-drop ALL
+	)
+	# Cgroups: Android's process-state handling (foreground/background,
+	# freezing) runs through libprocessgroup. WGAPPS_CGROUPS=0 restores
+	# Lepton's --cgroups=disabled.
+	if [[ "${WGAPPS_CGROUPS:-1}" == "0" ]]; then
+		ARGS+=(--cgroups=disabled)
+	else
+		# Podman's default pids limit (2048) is below Android's thread count
+		# during boot; thread creation then fails with EAGAIN. The user slice's
+		# TasksMax still bounds the session.
+		ARGS+=(--security-opt unmask=/sys/fs/cgroup --pids-limit=-1)
+	fi
+	local cap
+	for cap in audit_control sys_nice wake_alarm setpcap setgid setuid sys_ptrace \
+		sys_admin block_suspend sys_time net_admin net_raw net_bind_service kill \
+		dac_override dac_read_search fsetid mknod syslog chown sys_resource fowner \
+		ipc_lock sys_chroot; do
+		ARGS+=(--cap-add "$cap")
+	done
+	if [[ -f "$seccomp" ]]; then
+		ARGS+=(--security-opt "seccomp=$seccomp")
+	fi
+	# shellcheck disable=SC2054 # commas are mount options, not separators
+	ARGS+=(
+		--tmpfs /dev:rw,nosuid,U
+		--tmpfs /dev/socket:rw,nosuid,noexec,mode=0755,U
+		--tmpfs /tmp:rw,nosuid,nodev,noexec,U
+		--tmpfs /var:rw,nosuid,nodev,noexec,U
+		--tmpfs /run:rw,nosuid,nodev,noexec,U
+		--tmpfs /waydroid/xdg
+		# init remounts / read-only after early boot; Android needs /mnt writable
+		# (stock Waydroid LXC mounts a tmpfs here too).
+		--tmpfs /mnt:rw,nosuid,nodev,mode=0755,U
+		--mount type=devpts,destination=/dev/pts,mode=644,ptmxmode=666
+		--mount "type=bind,source=$DATA,destination=/data,rw"
+		--mount "type=bind,source=$RUNDIR/waydroid.prop,destination=/vendor/waydroid.prop,ro"
+		--mount "type=bind,source=$SHARE,destination=/data/local/tmp/host_share,rw"
+	)
+	# Runtime overrides: every file under overrides/ (from the release),
+	# overrides-generated/ (derived from the user's vendor image) and
+	# local-overrides/ (device-local files; never touched by updates) is
+	# bind-mounted read-only over the same path in Android. The extracted image
+	# is never modified.
+	local f dir
+	for dir in overrides overrides-generated local-overrides; do
+		[[ -d "$BASE/$dir" ]] || continue
+		while IFS= read -r -d '' f; do
+			ARGS+=(--mount "type=bind,source=$BASE/$dir/$f,destination=/$f,ro")
+		done < <(cd "$BASE/$dir" && find . -type f -printf '%P\0')
+	done
+	local dev
+	for dev in /dev/dri/card0 /dev/dri/renderD128 /dev/zero /dev/null /dev/full \
+		/dev/fuse /dev/tty /dev/shm /dev/snd /dev/uhid /dev/net/tun /dev/random \
+		/dev/urandom; do
+		bind "$dev" "$dev" rw
+	done
+	# Android init logs to /dev/kmsg; capture it in a file for debugging.
+	: >"$RUNDIR/kmsg.log"
+	bind "$RUNDIR/kmsg.log" /dev/kmsg rw
+	bind /dev/char /dev/char rw
+	bind "$XDG/pulse/native" /waydroid/xdg/pulse/native "rw,U"
+	if [[ "$headless" != "true" ]]; then
+		[[ -S "$WAYLAND_SOCKET" ]] || die "no Wayland socket at $WAYLAND_SOCKET"
+		bind "$WAYLAND_SOCKET" /waydroid/xdg/wayland-0 "rw,U"
+	fi
+	# pasta on a private subnet like Lepton: pasta is the gateway on .1 and
+	# forwards DNS sent there to the host resolver. Android configures eth0 via
+	# pasta's DHCP, which advertises .1 as the DNS server (the host's own
+	# resolver is a 127.0.0.53 stub Android cannot reach). Container ports
+	# (adb) are forwarded to the host. --dns-host must be explicit: with -D set,
+	# pasta otherwise forwards queries for .1 back to .1 and they time out.
+	local host_dns
+	host_dns="$(awk '/^nameserver/ { print $2; exit }' /etc/resolv.conf)"
+	[[ -n "$host_dns" ]] || die "no nameserver in /etc/resolv.conf"
+	ARGS+=(--network "pasta:-I,eth0,--ipv4-only,--no-ndp,-a,$NET_ADDR,-n,24,-g,$NET_SUBNET.1,-m,1500,--no-dhcpv6,--map-gw,--dns-forward,$NET_SUBNET.1,-D,$NET_SUBNET.1,--dhcp-dns,--dns-host,$host_dns,-t,auto,-u,auto")
+	# Skip first-stage init (device nodes, mounts) as Waydroid does.
+	ARGS+=(--rootfs "$ROOTFS:O" /system/bin/init second_stage)
+
+	log "starting $NAME (headless=$headless)"
+	podman "${ARGS[@]}" >/dev/null
+	start_pad
+}
+
+# Steam's virtual Xbox pad -> Android remote keys (see wgapps-pad). The
+# forwarder reaches Waydroid's keyboard FIFO through the container's /proc
+# root. Do not mount /dev/input from the host: if /dev/input exists when
+# Android's init starts, its keychord watcher opens each new FIFO read-only
+# and blocks forever, which hangs boot.
+start_pad() {
+	local pid
+	stop_pad
+	pid="$(podman inspect -f '{{.State.Pid}}' "$NAME" 2>/dev/null || true)"
+	[[ -n "$pid" && "$pid" != 0 ]] || return 0
+	setsid /usr/bin/python3 "$BIN/wgapps-pad" "/proc/$pid/root/dev/input/wl_keyboard_events" \
+		>>"$RUNDIR/pad.log" 2>&1 </dev/null &
+	echo $! >"$RUNDIR/pad.pid"
+}
+
+stop_pad() {
+	local pid
+	pid="$(cat "$RUNDIR/pad.pid" 2>/dev/null || true)"
+	if [[ -n "$pid" ]] && grep -q wgapps-pad "/proc/$pid/cmdline" 2>/dev/null; then
+		kill "$pid" 2>/dev/null || true
+	fi
+	rm -f "$RUNDIR/pad.pid"
+}
+
+cmd_stop() {
+	if running; then
+		asys "setprop sys.powerctl shutdown" 2>/dev/null || true
+		podman wait --condition=stopped "$NAME" >/dev/null 2>&1 &
+		local waiter=$!
+		local i
+		for i in $(seq 1 20); do
+			running || break
+			sleep 1
+		done
+		kill "$waiter" 2>/dev/null || true
+	fi
+	podman rm -f "$NAME" >/dev/null 2>&1 || true
+	stop_pad
+	log "stopped"
+}
+
+boot_done() {
+	[[ "$(asys 'getprop sys.boot_completed' 2>/dev/null | tr -d '\r')" == "1" ]]
+}
+
+cmd_wait_boot() {
+	local timeout="${1:-180}" i
+	for ((i = 0; i < timeout; i++)); do
+		running || die "container exited during boot"
+		boot_done && return 0
+		sleep 1
+	done
+	die "boot not complete after ${timeout}s"
+}
+
+cmd_status() {
+	if ! running; then
+		echo "stopped"
+		return 0
+	fi
+	echo "running"
+	# shellcheck disable=SC2016 # expands inside Android
+	asys 'echo "boot_completed=$(getprop sys.boot_completed) bootanim=$(getprop init.svc.bootanim) sf=$(getprop init.svc.surfaceflinger) zygote=$(getprop init.svc.zygote)"' 2>/dev/null || true
+}
+
+launcher_activity() {
+	asys "cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER '$1'" |
+		tr -d '\r' | tail -n 1
+}
+
+cmd_launch() {
+	local pkg="${1:?package required}" act
+	if ! running; then
+		cmd_start
+	fi
+	cmd_wait_boot 240
+	act="$(launcher_activity "$pkg")"
+	[[ "$act" == */* ]] || die "no launcher activity for $pkg"
+	asys "am start -W -n '$act'" >/dev/null
+	log "launched $act"
+}
+
+cmd_run() {
+	local pkg="${1:?package required}"
+	cmd_launch "$pkg"
+	# Give the app a moment to create its process, then follow it until it exits.
+	sleep 3
+	while running && [[ -n "$(asys "pidof '$pkg'" 2>/dev/null | tr -d '\r')" ]]; do
+		sleep 2
+	done
+	log "$pkg exited"
+	if [[ "${WGAPPS_KEEP_RUNNING:-false}" != "true" ]]; then
+		cmd_stop
+	fi
+}
+
+# Steam launches shortcuts under `reaper SteamLaunch AppId=<id>`, and
+# gamescope maps a Wayland client to a Steam app by walking the client's
+# process ancestry to that reaper. conmon detaches and is re-parented to the
+# reaper (a child subreaper), so Android must be (re)started from here for
+# the window to get focus, the overlay and Quit. Quitting from Steam
+# terminates this script; stop Android cleanly on the way out.
+cmd_steam() {
+	local pkg="${1:-}" act
+	if running; then
+		log "restarting Android under the Steam launch"
+		cmd_stop
+	fi
+	trap 'cmd_stop; exit 0' TERM INT HUP
+	cmd_start
+	cmd_wait_boot 240
+	if [[ -n "$pkg" ]]; then
+		act="$(launcher_activity "$pkg")"
+		if [[ "$act" == */* ]]; then
+			asys "am start -n '$act'" >/dev/null
+		else
+			log "no launcher activity for $pkg; showing the home screen"
+		fi
+	fi
+	podman wait "$NAME" >/dev/null 2>&1 &
+	wait $! || true
+	trap - TERM INT HUP
+	log "Android exited"
+}
+
+# --- install, update, uninstall -------------------------------------------
+
+LEPTON_SECCOMP="$HOME/.local/share/Steam/steamapps/common/Lepton/liblepton/lepton.seccomp.json"
+
+check_prereqs() {
+	local bad=0 tool free
+	[[ "$(uname -m)" == "aarch64" ]] || {
+		log "needs an aarch64 Steam Frame (found $(uname -m))"
+		bad=1
+	}
+	for tool in podman debugfs bsdtar curl sha256sum python3; do
+		command -v "$tool" >/dev/null || {
+			log "missing tool: $tool"
+			bad=1
+		}
+	done
+	if command -v podman >/dev/null &&
+		[[ "$(podman version -f '{{.Client.Version}}' 2>/dev/null | cut -d. -f1)" -lt 5 ]]; then
+		log "needs podman 5 or newer"
+		bad=1
+	fi
+	[[ -r /dev/dri/renderD128 && -w /dev/dri/renderD128 ]] || {
+		log "no access to /dev/dri/renderD128 (GPU)"
+		bad=1
+	}
+	mkdir -p "$BASE"
+	free="$(df -Pk "$BASE" | awk 'NR == 2 { print int($4 / 1048576) }')"
+	[[ "$free" -ge 8 ]] || {
+		log "needs about 8 GB free under $BASE (have ${free} GB)"
+		bad=1
+	}
+	[[ "$bad" == 0 ]] || die "prerequisites not met"
+}
+
+steam_running() { pgrep -x steam >/dev/null; }
+
+cmd_install() {
+	check_prereqs
+	mkdir -p "$BASE/images" "$RUNDIR"
+	if [[ -f "$LEPTON_SECCOMP" ]]; then
+		# Valve's profile for Android in rootless podman on this kernel; used
+		# when Lepton is installed, otherwise podman's default profile.
+		cp "$LEPTON_SECCOMP" "$BASE/lepton.seccomp.json"
+	fi
+	log "downloading Waydroid's GAPPS images from Waydroid (about 1.3 GB)"
+	"$BIN/fetch-images.sh" || die "download failed; run 'wgapps install' again to resume"
+	cmd_prepare --force
+	if [[ "${WGAPPS_SKIP_SHORTCUTS:-0}" == "1" ]]; then
+		log "skipping Steam shortcuts (WGAPPS_SKIP_SHORTCUTS=1)"
+	elif steam_running; then
+		log "Steam is running, so no shortcut was added. With Steam closed, run:"
+		log "  $BIN/steam-shortcuts.py add Android"
+	else
+		python3 "$BIN/steam-shortcuts.py" add Android
+	fi
+	cat >&2 <<NEXT
+
+Installed $(cmd_version). Next:
+  1. Launch "Android" from the Steam library (first boot takes about a minute).
+  2. Register this device for Google sign-in: print the GSF ID with
+       $BIN/wgapps gsf-id
+     and enter it at https://www.google.com/android/uncertified
+  3. Per-app Steam shortcuts (Steam closed):
+       $BIN/steam-shortcuts.py add Plex com.plexapp.android
+     In Steam, give each one the default Gamepad controller layout.
+NEXT
+}
+
+cmd_gsf_id() {
+	running || die "start Android first"
+	asys "sqlite3 /data/data/com.google.android.gsf/databases/gservices.db \"select value from main where name='android_id'\""
+}
+
+image_ref() {
+	local want="${1:-}" cur
+	cur="$(cat "$BASE/image" 2>/dev/null || echo "$DEFAULT_IMAGE:latest")"
+	if [[ -z "$want" ]]; then
+		echo "${cur%:*}:latest"
+	elif [[ "$want" == */* ]]; then
+		echo "$want"
+	else
+		echo "${cur%:*}:$want"
+	fi
+}
+
+cmd_update() {
+	local ref cid stage="$BASE/.staging" prev="$BASE/.previous" item
+	ref="$(image_ref "${1:-}")"
+	log "pulling $ref"
+	if ! podman pull -q "$ref" >/dev/null 2>&1; then
+		podman image exists "$ref" || die "cannot pull $ref"
+		log "warning: cannot reach the registry; using the local copy of $ref"
+	fi
+	rm -rf "$stage"
+	mkdir -p "$stage"
+	cid="$(podman create "$ref" none)" || die "cannot unpack $ref"
+	if ! podman cp "$cid:/wgapps/." "$stage/"; then
+		podman rm "$cid" >/dev/null
+		die "image $ref has no /wgapps"
+	fi
+	podman rm "$cid" >/dev/null
+	[[ -f "$stage/bin/wgapps" ]] || die "image $ref has no bin/wgapps"
+	rm -rf "$prev"
+	mkdir -p "$prev"
+	for item in bin overrides VERSION image; do
+		if [[ -e "$BASE/$item" ]]; then mv "$BASE/$item" "$prev/"; fi
+	done
+	for item in bin overrides VERSION; do
+		if [[ -e "$stage/$item" ]]; then mv "$stage/$item" "$BASE/"; fi
+	done
+	chmod 0755 "$BASE"/bin/*
+	echo "$ref" >"$BASE/image"
+	rm -rf "$stage"
+	log "updated to $(cat "$BASE/VERSION" 2>/dev/null || echo unknown) ($ref)"
+	if running; then log "restart Android to use it"; fi
+}
+
+cmd_rollback() {
+	local prev="$BASE/.previous" item
+	[[ -f "$prev/bin/wgapps" ]] || die "nothing to roll back to"
+	for item in bin overrides VERSION image; do
+		rm -rf "${BASE:?}/$item"
+		if [[ -e "$prev/$item" ]]; then mv "$prev/$item" "$BASE/"; fi
+	done
+	rm -rf "$prev"
+	log "rolled back to $(cat "$BASE/VERSION" 2>/dev/null || echo unknown)"
+}
+
+cmd_uninstall() {
+	local name
+	[[ "${1:-}" == "--yes" ]] ||
+		die "this deletes $BASE including all Android data; run: wgapps uninstall --yes"
+	cmd_stop
+	if steam_running; then
+		log "Steam is running; remove the Android shortcuts from the Steam library yourself"
+	else
+		while IFS=$'\t' read -r name _; do
+			python3 "$BIN/steam-shortcuts.py" remove "$name"
+		done < <(python3 "$BIN/steam-shortcuts.py" list | grep -F "$BIN/wgapps")
+	fi
+	podman unshare rm -rf "$BASE"
+	log "removed $BASE"
+}
+
+cmd_version() {
+	echo "$(cat "$BASE/VERSION" 2>/dev/null || echo dev) ($(cat "$BASE/images/variant" 2>/dev/null || echo "no Android images"))"
+}
+
+main() {
+	local cmd="${1:-help}"
+	shift || true
+	case "$cmd" in
+	install) cmd_install ;;
+	update) cmd_update "$@" ;;
+	rollback) cmd_rollback ;;
+	uninstall) cmd_uninstall "$@" ;;
+	version) cmd_version ;;
+	gsf-id) cmd_gsf_id ;;
+	prepare) cmd_prepare "$@" ;;
+	_migrate-ids) migrate_data_ids "$@" ;;
+	start) cmd_start "$@" ;;
+	stop) cmd_stop ;;
+	status) cmd_status ;;
+	wait-boot) cmd_wait_boot "$@" ;;
+	sh)
+		if [[ $# -gt 0 ]]; then
+			asys "$*"
+		else
+			podman exec -it "$NAME" /system/bin/sh
+		fi
+		;;
+	logcat) podman exec "$NAME" /system/bin/logcat "$@" ;;
+	launch) cmd_launch "$@" ;;
+	run) cmd_run "$@" ;;
+	steam) cmd_steam "$@" ;;
+	help | -h | --help) usage ;;
+	*)
+		usage
+		exit 2
+		;;
+	esac
+}
+
+main "$@"

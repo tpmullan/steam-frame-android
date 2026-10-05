@@ -1,0 +1,18 @@
+# Mount binderfs inside the container and expose the device names Android
+# expects. The Frame kernel creates anbox-* devices by default
+# (CONFIG_ANDROID_BINDER_DEVICES); Waydroid's host tooling normally does this.
+on early-init
+    mkdir /dev/binderfs
+    exec - root root -- /system/bin/mount -t binder binder /dev/binderfs
+    exec - root root -- /system/bin/mv /dev/binderfs/anbox-binder /dev/binderfs/binder
+    exec - root root -- /system/bin/mv /dev/binderfs/anbox-hwbinder /dev/binderfs/hwbinder
+    exec - root root -- /system/bin/mv /dev/binderfs/anbox-vndbinder /dev/binderfs/vndbinder
+    symlink /dev/binderfs/binder /dev/binder
+    symlink /dev/binderfs/hwbinder /dev/hwbinder
+    symlink /dev/binderfs/vndbinder /dev/vndbinder
+    chmod 0666 /dev/binderfs/binder
+    chmod 0666 /dev/binderfs/hwbinder
+    chmod 0666 /dev/binderfs/vndbinder
+
+on early-init
+    mount none none /proc/sys rw remount

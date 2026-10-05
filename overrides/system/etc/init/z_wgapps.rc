@@ -1,0 +1,52 @@
+# Service overrides for running in rootless podman, bind-mounted at runtime
+# (the image is not modified). Named z_* so init parses it after
+# init.waydroid.rc, which already overrides the audio HAL (Lepton's
+# z_audio.rc uses the same trick).
+
+# ueventd: podman supplies the device nodes and waydroid.prop sets
+# ro.cold_boot_done=true. The real ueventd aborts in the container and is
+# marked critical, so four crashes reboot Android. Replace it with a no-op.
+service ueventd /system/bin/toybox true
+    override
+    class core
+    oneshot
+
+# Audio HAL: container root is the host user that owns the PulseAudio socket.
+# Drop `rlimit rtprio`: the host's hard RLIMIT_RTPRIO is 0 and setrlimit fails.
+service vendor.audio-hal /vendor/bin/hw/android.hardware.audio.service
+    override
+    class hal
+    user root
+    group root audioserver audio camera drmrpc inet media mediadrm net_bt net_bt_admin net_bw_acct wakelock context_hub
+    capabilities BLOCK_SUSPEND
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh HighPerformance
+    onrestart restart audioserver
+
+# No cameras are exposed to Android; cameraserver crash-loops on rtprio.
+service cameraserver /system/bin/cameraserver
+    override
+    class main
+    user cameraserver
+    group audio camera input drmrpc
+    disabled
+
+# Display HAL: gamescope's Wayland socket is writable only by the host user,
+# which is container root. Stock Waydroid runs this as `host`. Keeps
+# init.waydroid.rc's --desktop_file_hint.
+service vendor.hwcomposer-2-1 /vendor/bin/hw/android.hardware.graphics.composer@2.1-service --desktop_file_hint=Waydroid.desktop
+    override
+    class hal animation
+    user root
+    # Primary group input: the HAL creates /dev/input/wl_*_events FIFOs
+    # (mode 0660) that system_server's InputReader must be able to open.
+    group input root system graphics drmrpc
+    capabilities SYS_NICE
+    onrestart restart surfaceflinger
+    task_profiles ServiceCapacityLow
+
+# Routing workaround for the missing iptables tables (see wgapps-net.sh).
+service wgapps-net /system/bin/sh /system/etc/wgapps-net.sh
+    class late_start
+    user root
+    group root

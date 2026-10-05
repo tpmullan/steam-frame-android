@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Generate overrides derived from the user's own Waydroid vendor image.
+
+Two fixes edit files that ship in Waydroid's vendor image. Instead of
+publishing edited copies (which would re-host Waydroid's files and go stale
+with new builds), they are generated on the Frame from the extracted image:
+
+- vendor/etc/vintf/manifest.xml without the android.hardware.media.omx HAL.
+  The arm64_only image declares it but ships no OMX service (AOSP builds
+  mediacodec 32-bit only), so mediaserver waits forever, media.player never
+  registers, and storage, codecs and web content hang.
+- vendor/etc/seccomp_policy/mediaswcodec.policy plus the scheduling
+  syscalls codec threads use in the container (minijail otherwise kills
+  mediaswcodec on the first video decode).
+
+Usage: wgapps-gen-overrides <rootfs> <output dir>
+"""
+
+import pathlib
+import re
+import sys
+
+MANIFEST = "vendor/etc/vintf/manifest.xml"
+POLICY = "vendor/etc/seccomp_policy/mediaswcodec.policy"
+DROP_HALS = ("android.hardware.media.omx",)
+EXTRA_SYSCALLS = (
+    "sched_setscheduler",
+    "sched_getscheduler",
+    "sched_setparam",
+    "sched_getparam",
+)
+
+HAL_RE = re.compile(r"[ \t]*<hal\b[^>]*>.*?</hal>[ \t]*\n?", re.DOTALL)
+NAME_RE = re.compile(r"<name>\s*([^<\s]+)\s*</name>")
+
+
+def strip_hals(xml, names=DROP_HALS):
+    """Remove <hal> blocks whose first <name> is in names; keep formatting."""
+    removed = []
+
+    def repl(m):
+        n = NAME_RE.search(m.group(0))
+        if n and n.group(1) in names:
+            removed.append(n.group(1))
+            return ""
+        return m.group(0)
+
+    return HAL_RE.sub(repl, xml), removed
+
+
+def extend_policy(text, syscalls=EXTRA_SYSCALLS):
+    present = {
+        line.split(":", 1)[0].strip()
+        for line in text.splitlines()
+        if ":" in line and not line.lstrip().startswith("#")
+    }
+    missing = [s for s in syscalls if s not in present]
+    if not missing:
+        return text
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "# wgapps: codec threads set their priority in the rootless container\n"
+    text += "".join(f"{s}: 1\n" for s in missing)
+    return text
+
+
+def main(argv):
+    if len(argv) != 2:
+        sys.exit(__doc__)
+    rootfs, out = pathlib.Path(argv[0]), pathlib.Path(argv[1])
+    manifest = rootfs / MANIFEST
+    if not manifest.is_file():
+        sys.exit(f"wgapps-gen-overrides: missing {manifest}")
+    xml, removed = strip_hals(manifest.read_text())
+    target = out / MANIFEST
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(xml)
+    print(f"{MANIFEST}: removed {', '.join(removed) or 'nothing'}")
+
+    policy = rootfs / POLICY
+    base = policy.read_text() if policy.is_file() else ""
+    target = out / POLICY
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(extend_policy(base))
+    print(f"{POLICY}: {'extended' if base else 'created'}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

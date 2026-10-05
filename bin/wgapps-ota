@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""Resolve Waydroid images from Waydroid's own OTA index.
+
+Prints shell-safe assignments for fetch-images.sh:
+
+  BUILD=20260927
+  SYSTEM_URL=... SYSTEM_SHA256=... SYSTEM_FILE=...
+  VENDOR_URL=... VENDOR_SHA256=... VENDOR_FILE=...
+
+The index is what `waydroid init` reads; the `id` of each entry is the
+SHA-256 of the zip. Google apps are never hosted by this project: the user's
+Frame downloads them from Waydroid's servers.
+
+Usage: wgapps-ota [--build YYYYMMDD] [--variant waydroid_arm64_only]
+                  [--system-index FILE_OR_URL] [--vendor-index FILE_OR_URL]
+"""
+
+import argparse
+import json
+import re
+import shlex
+import sys
+import urllib.request
+
+OTA = "https://ota.waydro.id"
+BUILD_RE = re.compile(r"-(\d{8})-")
+
+
+def system_index_url(variant):
+    return f"{OTA}/system/lineage/{variant}/GAPPS.json"
+
+
+def vendor_index_url(variant):
+    return f"{OTA}/vendor/{variant}/MAINLINE.json"
+
+
+def load(source):
+    if source.startswith("https://"):
+        with urllib.request.urlopen(source, timeout=60) as r:
+            return json.load(r)
+    with open(source) as f:
+        return json.load(f)
+
+
+def entries(index):
+    """Map build date -> entry, skipping malformed rows."""
+    out = {}
+    for e in index.get("response", []):
+        m = BUILD_RE.search(e.get("filename", ""))
+        sha = e.get("id", "")
+        if not m or not e.get("url", "").startswith("https://"):
+            continue
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            continue
+        out[m.group(1)] = e
+    return out
+
+
+def resolve(system_index, vendor_index, build=None):
+    """Pick a build present in both indexes: the requested one, or the newest."""
+    systems, vendors = entries(system_index), entries(vendor_index)
+    common = sorted(set(systems) & set(vendors))
+    if not common:
+        raise ValueError("no build is published for both system and vendor")
+    if build is None:
+        build = common[-1]
+    elif build not in common:
+        raise ValueError(f"build {build} not in both indexes (have {', '.join(common)})")
+    return build, systems[build], vendors[build]
+
+
+def main(argv):
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--build")
+    p.add_argument("--variant", default="waydroid_arm64_only")
+    p.add_argument("--system-index")
+    p.add_argument("--vendor-index")
+    a = p.parse_args(argv)
+    try:
+        build, sysent, venent = resolve(
+            load(a.system_index or system_index_url(a.variant)),
+            load(a.vendor_index or vendor_index_url(a.variant)),
+            a.build,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        sys.exit(f"wgapps-ota: {e}")
+    print(f"BUILD={build}")
+    for prefix, e in (("SYSTEM", sysent), ("VENDOR", venent)):
+        print(f"{prefix}_URL={shlex.quote(e['url'])}")
+        print(f"{prefix}_SHA256={e['id']}")
+        print(f"{prefix}_FILE={shlex.quote(e['filename'])}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

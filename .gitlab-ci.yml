@@ -1,0 +1,126 @@
+stages:
+  - lint
+  - test
+  - build
+  - validate
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - when: never
+
+variables:
+  IMAGE_REF: "$CI_REGISTRY_IMAGE/steam-frame-android"
+  SHELL_FILES: "bin/wgapps bin/fetch-images.sh tools/deploy.sh overrides/system/etc/wgapps-net.sh"
+  PY_FILES: "bin/wgapps-pad bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py tests"
+
+shellcheck:
+  stage: lint
+  image: koalaman/shellcheck-alpine:v0.10.0
+  script:
+    - shellcheck $SHELL_FILES
+
+shfmt:
+  stage: lint
+  image: mvdan/shfmt:v3.10.0-alpine
+  script:
+    - shfmt -d $SHELL_FILES
+
+ruff:
+  stage: lint
+  image: ghcr.io/astral-sh/ruff:0.13.0-alpine
+  script:
+    - ruff check --no-cache $PY_FILES
+    - ruff format --check $PY_FILES
+
+unit-tests:
+  stage: test
+  image: python:3.12-slim
+  needs: []
+  script:
+    - cd tests && python -m unittest -v
+
+# A FROM scratch image of plain files: no emulation is needed to build the
+# arm64 variant on the amd64 runners (no RUN steps).
+.docker:
+  image: docker:27.5.1
+  services:
+    - name: docker:27.5.1-dind
+      alias: docker
+  variables:
+    DOCKER_BUILDKIT: "1"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - |
+      for attempt in $(seq 1 30); do
+        docker version >/dev/null 2>&1 && break
+        echo "Docker daemon not ready (attempt $attempt)" >&2
+        sleep 2
+      done
+      docker version >/dev/null
+    - printf '%s' "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+build-image:
+  stage: build
+  extends: .docker
+  needs: [shellcheck, shfmt, ruff, unit-tests]
+  script:
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        echo "${CI_COMMIT_TAG#v}" > VERSION
+      else
+        echo "$(cat VERSION)+${CI_COMMIT_SHORT_SHA}" > VERSION
+      fi
+      echo "VERSION=$(cat VERSION)"
+    - docker buildx create --use --name sfa-builder --driver docker-container
+    - |
+      tags="--tag $IMAGE_REF:$CI_COMMIT_SHORT_SHA --tag $IMAGE_REF:$CI_COMMIT_REF_SLUG"
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        tags="$tags --tag $IMAGE_REF:$CI_COMMIT_TAG --tag $IMAGE_REF:latest"
+      fi
+      docker buildx build --platform linux/arm64 --file Containerfile --push \
+        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.version=$(cat VERSION)" \
+        $tags .
+
+validate-image:
+  stage: validate
+  extends: .docker
+  needs: [build-image]
+  script:
+    - docker pull --platform linux/arm64 "$IMAGE_REF:$CI_COMMIT_SHORT_SHA"
+    # List what the published layers contain (docker export would add
+    # .dockerenv, etc/hosts and so on, which are not in the image).
+    - mkdir saved && docker save "$IMAGE_REF:$CI_COMMIT_SHORT_SHA" | tar -x -C saved
+    - |
+      for blob in saved/blobs/sha256/*; do
+        tar -tf "$blob" 2>/dev/null || true
+      done | sed 's#/$##' | sort -u > image-files.txt
+    - cat image-files.txt
+    # Our files are present.
+    - |
+      for f in wgapps/bin/wgapps wgapps/bin/wgapps-pad wgapps/bin/wgapps-ota \
+        wgapps/bin/wgapps-gen-overrides wgapps/bin/steam-shortcuts.py \
+        wgapps/bin/fetch-images.sh wgapps/VERSION wgapps/LICENSE \
+        wgapps/overrides/system/etc/init/z_wgapps.rc; do
+        grep -qx "$f" image-files.txt || { echo "missing $f"; exit 1; }
+      done
+    # Nothing from Waydroid or Google: no APKs, images, archives, and none
+    # of the files that are generated on the Frame from Waydroid's vendor image.
+    - |
+      if grep -E '\.(apk|img|zip|jar)$|vintf/manifest\.xml$|seccomp_policy/' image-files.txt; then
+        echo "image contains files it must not ship"; exit 1
+      fi
+    - |
+      if grep -vE '^wgapps(/|$)' image-files.txt; then
+        echo "files outside /wgapps"; exit 1
+      fi
+  artifacts:
+    when: always
+    paths:
+      - image-files.txt
+    expire_in: 14 days

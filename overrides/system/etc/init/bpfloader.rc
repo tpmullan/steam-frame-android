@@ -1,0 +1,11 @@
+# Override of the image's bpfloader.rc, bind-mounted at runtime (the image is
+# not modified). A rootless container cannot load kernel BPF programs, and the
+# stock service reboots Android when bpfloader fails. Same approach as Valve's
+# Lepton: keep the service defined but never start it; waydroid.prop sets
+# bpf.progs_loaded=1 so netd does not wait for it.
+on load_bpf_programs
+    write /proc/sys/net/core/bpf_jit_enable 1
+
+service bpfloader /system/bin/bpfloader
+    oneshot
+    disabled
