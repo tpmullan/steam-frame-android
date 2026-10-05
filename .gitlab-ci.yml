@@ -3,6 +3,7 @@ stages:
   - test
   - build
   - validate
+  - release
 
 workflow:
   rules:
@@ -13,7 +14,10 @@ workflow:
 
 variables:
   IMAGE_REF: "$CI_REGISTRY_IMAGE/steam-frame-android"
-  SHELL_FILES: "bin/wgapps bin/fetch-images.sh tools/deploy.sh overrides/system/etc/wgapps-net.sh"
+  # Public release targets (release tags only, see release-public).
+  PUBLIC_REPO: https://github.com/tpmullan/steam-frame-android
+  PUBLIC_IMAGE: ghcr.io/tpmullan/steam-frame-android
+  SHELL_FILES: "bin/wgapps bin/fetch-images.sh tools/deploy.sh tools/release.sh overrides/system/etc/wgapps-net.sh"
   PY_FILES: "bin/wgapps-pad bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py tests"
 
 shellcheck:
@@ -82,7 +86,8 @@ build-image:
         tags="$tags --tag $IMAGE_REF:$CI_COMMIT_TAG --tag $IMAGE_REF:latest"
       fi
       docker buildx build --platform linux/arm64 --file Containerfile --push \
-        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        --label "org.opencontainers.image.source=$PUBLIC_REPO" \
+        --label "org.opencontainers.image.licenses=GPL-3.0-or-later" \
         --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
         --label "org.opencontainers.image.version=$(cat VERSION)" \
         $tags .
@@ -124,3 +129,37 @@ validate-image:
     paths:
       - image-files.txt
     expire_in: 14 days
+
+# Release tags (vX.Y.Z, protected) publish the validated image to GHCR and a
+# snapshot commit plus tag to the public GitHub repository. Nothing runs on
+# GitHub. Needs two protected CI variables set in GitLab by the maintainer:
+#   GITHUB_RELEASE_TOKEN  classic token with public_repo (or repo) and
+#                         write:packages, masked
+#   RELEASE_DENY          File variable: extended regexes that must not appear
+#                         in released files (internal hostnames, LAN ranges)
+release-public:
+  stage: release
+  extends: .docker
+  needs: [validate-image]
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+  variables:
+    GIT_DEPTH: "0"
+    GIT_AUTHOR_NAME: Tom Mullaney
+    GIT_AUTHOR_EMAIL: 2078150+tpmullan@users.noreply.github.com
+    GIT_COMMITTER_NAME: Tom Mullaney
+    GIT_COMMITTER_EMAIL: 2078150+tpmullan@users.noreply.github.com
+    # Supplies the token to git over HTTPS without putting it in a URL.
+    GIT_CONFIG_COUNT: "1"
+    GIT_CONFIG_KEY_0: credential.helper
+    GIT_CONFIG_VALUE_0: '!f() { echo username=x-access-token; echo "password=$$GITHUB_RELEASE_TOKEN"; }; f'
+  script:
+    - test -n "$GITHUB_RELEASE_TOKEN" || { echo "GITHUB_RELEASE_TOKEN is not set"; exit 1; }
+    - test -f "$RELEASE_DENY" || { echo "RELEASE_DENY file variable is not set"; exit 1; }
+    - apk add --no-cache bash git >/dev/null
+    - printf '%s' "$GITHUB_RELEASE_TOKEN" | docker login ghcr.io -u tpmullan --password-stdin
+    # Code first: release.sh refuses deny-listed content and existing tags,
+    # so a failure here publishes nothing.
+    - RELEASE_REMOTE="$PUBLIC_REPO.git" bash tools/release.sh "$CI_COMMIT_TAG" HEAD
+    - docker buildx imagetools create --tag "$PUBLIC_IMAGE:$CI_COMMIT_TAG" --tag "$PUBLIC_IMAGE:latest" "$IMAGE_REF:$CI_COMMIT_TAG"
+    - docker buildx imagetools inspect "$PUBLIC_IMAGE:$CI_COMMIT_TAG"

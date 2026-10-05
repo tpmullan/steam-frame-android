@@ -89,7 +89,10 @@ from Waydroid under their own terms and are not part of this project.
   `bin/wgapps-gen-overrides` derives the two vendor fixes from the
   installed image; `overrides/` holds our own init and network files.
 - Tests: `cd tests && python3 -m unittest -v`. Lint: shellcheck, shfmt,
-  ruff. CI: `.github/workflows/ci.yml` (publishes to GHCR); an equivalent
-  `.gitlab-ci.yml` exists for GitLab runners.
+  ruff. CI runs on GitLab (`.gitlab-ci.yml`).
 - `tools/deploy.sh` copies a checkout to a Frame over SSH in the release
   layout.
+- Releases: development happens in a separate repository. A release tag
+  there runs CI, which publishes `ghcr.io/tpmullan/steam-frame-android:vX.Y.Z`
+  and `:latest` and pushes one snapshot commit per release here
+  (`tools/release.sh`).
