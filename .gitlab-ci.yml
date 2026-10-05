@@ -85,18 +85,50 @@ build-image:
       if [ -n "$CI_COMMIT_TAG" ]; then
         tags="$tags --tag $IMAGE_REF:$CI_COMMIT_TAG --tag $IMAGE_REF:latest"
       fi
+      # No provenance/SBOM attestations: they record the build context's git
+      # remote and registry names (internal hostnames) and would be published.
       docker buildx build --platform linux/arm64 --file Containerfile --push \
+        --provenance=false --sbom=false \
         --label "org.opencontainers.image.source=$PUBLIC_REPO" \
         --label "org.opencontainers.image.licenses=GPL-3.0-or-later" \
         --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
         --label "org.opencontainers.image.version=$(cat VERSION)" \
         $tags .
 
+# Fails if an image (manifest, config or any layer) carries attestations or
+# internal names. Usage: check_image_clean <ref> (docker logged in).
+.leak_check: &leak_check |
+  check_image_clean() {
+    ref="$1"
+    raw="$(docker buildx imagetools inspect --raw "$ref")"
+    if printf '%s' "$raw" | grep -q -E 'attestation-manifest|image\.index|manifest\.list'; then
+      echo "$ref is an index or carries attestations"; exit 1
+    fi
+    dir="$(mktemp -d)"
+    docker pull -q --platform linux/arm64 "$ref" >/dev/null
+    docker save "$ref" | tar -x -C "$dir"
+    printf '%s' "$raw" > "$dir/registry-manifest.json"
+    pat="$CI_SERVER_HOST|$CI_REGISTRY|svc\.cluster\.local|\.tun\."
+    if [ -f "${RELEASE_DENY:-}" ]; then
+      extra="$(grep -v -E '^[[:space:]]*(#|$)' "$RELEASE_DENY" | paste -sd '|' -)"
+      [ -n "$extra" ] && pat="$pat|$extra"
+    fi
+    # Only the image itself: its blobs and the registry manifest. docker
+    # save's own index.json/manifest.json/repositories name the local ref.
+    if grep -r -a -l -E "$pat" "$dir/blobs" "$dir/registry-manifest.json"; then
+      echo "$ref contains internal names (files above)"; exit 1
+    fi
+    rm -rf "$dir"
+    echo "$ref: single manifest, no internal names"
+  }
+
 validate-image:
   stage: validate
   extends: .docker
   needs: [build-image]
   script:
+    - *leak_check
+    - check_image_clean "$IMAGE_REF:$CI_COMMIT_SHORT_SHA"
     - docker pull --platform linux/arm64 "$IMAGE_REF:$CI_COMMIT_SHORT_SHA"
     # List what the published layers contain (docker export would add
     # .dockerenv, etc/hosts and so on, which are not in the image).
@@ -158,8 +190,10 @@ release-public:
     - test -f "$RELEASE_DENY" || { echo "RELEASE_DENY file variable is not set"; exit 1; }
     - apk add --no-cache bash git >/dev/null
     - printf '%s' "$GITHUB_RELEASE_TOKEN" | docker login ghcr.io -u tpmullan --password-stdin
+    - *leak_check
+    - check_image_clean "$IMAGE_REF:$CI_COMMIT_TAG"
     # Code first: release.sh refuses deny-listed content and existing tags,
     # so a failure here publishes nothing.
     - RELEASE_REMOTE="$PUBLIC_REPO.git" bash tools/release.sh "$CI_COMMIT_TAG" HEAD
     - docker buildx imagetools create --tag "$PUBLIC_IMAGE:$CI_COMMIT_TAG" --tag "$PUBLIC_IMAGE:latest" "$IMAGE_REF:$CI_COMMIT_TAG"
-    - docker buildx imagetools inspect "$PUBLIC_IMAGE:$CI_COMMIT_TAG"
+    - check_image_clean "$PUBLIC_IMAGE:$CI_COMMIT_TAG"
