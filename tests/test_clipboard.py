@@ -117,3 +117,24 @@ class HubTests(unittest.TestCase):
         hub.set("keep")
         hub.copied_on(":0", b"x" * (clip.MAX_BYTES + 1))
         self.assertEqual(hub.get(), "keep")
+
+
+class LshalTests(unittest.TestCase):
+    OUT = (
+        "android.hardware.graphics.composer@2.1::IComposer/default                 75\n"
+        "vendor.waydroid.clipboard@1.0::IWaydroidClipboard/default                 N/A\n"
+    )
+
+    def test_our_server_shows_no_pid(self):
+        self.assertEqual(clip.parse_server(self.OUT), clip.OURS)
+
+    def test_hwcomposer_holding_it(self):
+        out = self.OUT.replace(
+            "IWaydroidClipboard/default                 N/A",
+            "IWaydroidClipboard/default                 75",
+        )
+        self.assertEqual(clip.parse_server(out), "75")
+
+    def test_not_registered_or_no_output(self):
+        self.assertIsNone(clip.parse_server(self.OUT.splitlines()[0]))
+        self.assertIsNone(clip.parse_server(None))

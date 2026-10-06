@@ -12,8 +12,14 @@ This service registers the same HIDL interface from the host, on the
 container's hwbinder (libgbinder), and keeps one clipboard for Android and
 every gamescope X display (the Frame's VR backend does not sync the X11
 clipboard between gamescope's Xwayland servers either). HIDL lets a later
-registration replace an earlier one, so it registers after Android has
-booted and again whenever the hwcomposer restarts.
+registration replace an earlier one. Android's ClipboardService looks the
+service up once and caches it (lineageos.waydroid.Clipboard.getService), so
+this must hold the registration before that first lookup: it registers as
+soon as the container's hwservicemanager is up and re-registers whenever
+lshal shows another server (the hwcomposer) holding it, polling every
+0.25 s until boot completes. Registered objects are never released while
+the container runs, so a cached reference stays valid; the helper is tied
+to one container run and exits when it stops.
 
 Clipboard contents are never logged; only their sizes are.
 
@@ -42,7 +48,6 @@ INSTANCE = b"default"
 TX_SEND = 1  # sendClipboardData(string value)
 TX_GET = 2  # getClipboardData() generates (string value)
 MAX_BYTES = 1 << 20
-HWCOMPOSER = "android.hardware.graphics.composer@2.1-service"
 
 
 def log(msg: str) -> None:
@@ -589,35 +594,30 @@ class HidlClipboardService:
         self.bridge = bridge
         self._handler = TRANSACT_FUNC(self._transact)  # keep a reference
         self.sm = None
-        self.obj = None
+        self.device = None
+        # Every object we registered; Android may hold a cached reference to
+        # any of them, so they live as long as the helper.
+        self.objects = []
         loop = self.glib.g_main_loop_new(None, 0)
         threading.Thread(
             target=self.glib.g_main_loop_run, args=(loop,), name="glib", daemon=True
         ).start()
 
     def register(self, device: str) -> bool:
-        self.close()
-        self.sm = self.g.gbinder_servicemanager_new2(device.encode(), b"hidl", b"hidl")
+        if self.sm is None or self.device != device:
+            self.sm = self.g.gbinder_servicemanager_new2(device.encode(), b"hidl", b"hidl")
+            self.device = device
         if not self.sm or not self.g.gbinder_servicemanager_wait(self.sm, 30000):
             log(f"no hwservicemanager on {device}")
+            self.sm = None
             return False
-        self.obj = self.g.gbinder_servicemanager_new_local_object(
-            self.sm, IFACE, self._handler, None
-        )
-        status = self.g.gbinder_servicemanager_add_service_sync(self.sm, INSTANCE, self.obj)
+        obj = self.g.gbinder_servicemanager_new_local_object(self.sm, IFACE, self._handler, None)
+        status = self.g.gbinder_servicemanager_add_service_sync(self.sm, INSTANCE, obj)
         if status != GBINDER_STATUS_OK:
             log(f"registering {IFACE.decode()}/default failed ({status})")
             return False
-        log(f"registered {IFACE.decode()}/default")
+        self.objects.append(obj)
         return True
-
-    def close(self) -> None:
-        if self.obj:
-            self.g.gbinder_local_object_unref(self.obj)
-            self.obj = None
-        if self.sm:
-            self.g.gbinder_servicemanager_unref(self.sm)
-            self.sm = None
 
     def _transact(self, obj, req, code, flags, status, user_data):
         try:
@@ -661,13 +661,21 @@ def android(container: str, cmd: str) -> str | None:
     return podman("exec", container, "/system/bin/sh", "-c", cmd)
 
 
-def wait_for_boot(container: str, timeout: float = 300) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if android(container, "getprop sys.boot_completed") == "1":
-            return True
-        time.sleep(2)
-    return False
+FQNAME = IFACE.decode() + "/" + INSTANCE.decode()
+OURS = "N/A"  # lshal cannot see host processes: our server shows no PID
+
+
+def parse_server(lshal_output: str | None) -> str | None:
+    """Server column for the clipboard service in `lshal list ... --neat`."""
+    for line in (lshal_output or "").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == FQNAME:
+            return fields[1]
+    return None
+
+
+def registered_server(container: str) -> str | None:
+    return parse_server(android(container, "lshal list --types=b -i -p --neat"))
 
 
 def _stop(signum, frame) -> None:
@@ -681,25 +689,25 @@ def main() -> int:
         os.environ.get("WGAPPS_LIB", pathlib.Path(__file__).resolve().parent.parent / "lib")
     )
     try:
-        bridge = ClipboardBridge(ClipboardHub())
-        service = HidlClipboardService(libdir, bridge)
-        if not wait_for_boot(container):
-            log("Android did not finish booting; clipboard not shared")
+        pid = podman("inspect", "-f", "{{.State.Pid}}", container)
+        if not pid or pid == "0":
+            log("container is not running")
             return 1
-        registered_for = None
+        device = f"/proc/{pid}/root/dev/binderfs/hwbinder"
+        service = HidlClipboardService(libdir, ClipboardBridge(ClipboardHub()))
+        booted = False
         while True:
-            pid = podman("inspect", "-f", "{{.State.Pid}}", container)
-            composer = android(container, f"pidof {HWCOMPOSER}")
-            if not pid or pid == "0":
-                log("container stopped")
+            if podman("inspect", "-f", "{{.State.Pid}}", container) != pid:
+                log("container stopped or restarted")
                 return 0
-            # The hwcomposer registers its own (non-working) clipboard when it
-            # starts; register ours after it, and again if it restarts.
-            if composer != registered_for:
-                device = f"/proc/{pid}/root/dev/binderfs/hwbinder"
-                if service.register(device):
-                    registered_for = composer
-            time.sleep(15)
+            if os.path.exists(device):
+                server = registered_server(container)
+                if server != OURS and service.register(device):
+                    log(f"registered {FQNAME} (was: {server or 'none'})")
+                booted = booted or android(container, "getprop sys.boot_completed") == "1"
+            # Hold the registration through boot, until ClipboardService has
+            # looked the service up and cached it.
+            time.sleep(15 if booted else 0.25)
     except KeyboardInterrupt:
         return 0
     except OSError as e:
