@@ -675,7 +675,25 @@ def parse_server(lshal_output: str | None) -> str | None:
 
 
 def registered_server(container: str) -> str | None:
-    return parse_server(android(container, "lshal list --types=b -i -p --neat"))
+    # lshal exits non-zero when it cannot debug some service (ours does not
+    # implement getHashChain), but still lists everything on stdout.
+    res = subprocess.run(
+        [
+            "podman",
+            "exec",
+            container,
+            "/system/bin/lshal",
+            "list",
+            "--types=b",
+            "-i",
+            "-p",
+            "--neat",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return parse_server(res.stdout)
 
 
 def _stop(signum, frame) -> None:
