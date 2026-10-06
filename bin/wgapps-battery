@@ -135,7 +135,7 @@ def _stop(signum, frame) -> None:
 
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description="Mirror the host battery into Android")
-    p.add_argument("--interval", type=float, default=30.0)
+    p.add_argument("--interval", type=float, default=10.0)
     p.add_argument("--once", action="store_true")
     a = p.parse_args(argv)
     container = os.environ.get("WGAPPS_CONTAINER", "waydroid-gapps")

@@ -69,3 +69,51 @@ class StructLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DisplayDiscoveryTests(unittest.TestCase):
+    def test_displays_come_from_x11_sockets(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("X0", "X1", "X10", "Xfoo", "other"):
+                pathlib.Path(d, name).touch()
+            self.assertEqual(clip.gamescope_displays(pathlib.Path(d)), [":0", ":1", ":10"])
+            self.assertEqual(clip.gamescope_displays(pathlib.Path(d, "missing")), [])
+
+
+class FakeOwner:
+    def __init__(self, display):
+        self.display = display
+        self.taken = 0
+
+    def take_ownership(self):
+        self.taken += 1
+
+
+class HubTests(unittest.TestCase):
+    def hub(self, displays):
+        hub = clip.ClipboardHub.__new__(clip.ClipboardHub)  # no X libraries needed
+        hub._lock = clip.threading.Lock()
+        hub._text, hub._source = None, None
+        hub._owners = {d: FakeOwner(d) for d in displays}
+        return hub
+
+    def test_android_copy_is_owned_on_every_display(self):
+        hub = self.hub([":0", ":1"])
+        hub.set("from android")
+        self.assertEqual(hub.get(), "from android")
+        self.assertEqual([o.taken for o in hub._owners.values()], [1, 1])
+
+    def test_copy_on_one_display_is_owned_on_the_others(self):
+        hub = self.hub([":0", ":1", ":2"])
+        hub.copied_on(":1", b"from steam")
+        self.assertEqual(hub.get(), "from steam")
+        self.assertEqual({d: o.taken for d, o in hub._owners.items()}, {":0": 1, ":1": 0, ":2": 1})
+
+    def test_oversized_display_copy_is_ignored(self):
+        hub = self.hub([":0"])
+        hub.set("keep")
+        hub.copied_on(":0", b"x" * (clip.MAX_BYTES + 1))
+        self.assertEqual(hub.get(), "keep")

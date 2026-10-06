@@ -9,10 +9,11 @@ requests (it only syncs X11 selections between its Xwayland servers), so
 that path is dead on the Frame.
 
 This service registers the same HIDL interface from the host, on the
-container's hwbinder (libgbinder), and bridges it to gamescope's X11
-CLIPBOARD selection. HIDL lets a later registration replace an earlier one,
-so it registers after Android has booted and again whenever the hwcomposer
-restarts.
+container's hwbinder (libgbinder), and keeps one clipboard for Android and
+every gamescope X display (the Frame's VR backend does not sync the X11
+clipboard between gamescope's Xwayland servers either). HIDL lets a later
+registration replace an earlier one, so it registers after Android has
+booted and again whenever the hwcomposer restarts.
 
 Clipboard contents are never logged; only their sizes are.
 
@@ -20,7 +21,7 @@ Usage: wgapps-clipboard
 Environment:
   WGAPPS_CONTAINER  container name (default waydroid-gapps)
   WGAPPS_LIB        directory with libgbinder.so.1 (default ../lib next to bin/)
-  WGAPPS_DISPLAY    X display of gamescope's Xwayland (default $DISPLAY or :0)
+X displays are found from /tmp/.X11-unix and rescanned every 10 s.
 """
 
 from __future__ import annotations
@@ -197,39 +198,246 @@ def _load_x11():
     for name, (restype, argtypes) in sigs.items():
         fn = getattr(x, name)
         fn.restype, fn.argtypes = restype, argtypes
+    # Several threads use Xlib (one connection each); this must come first.
+    x.XInitThreads.restype = ctypes.c_int
+    x.XInitThreads()
     return x
 
 
-class X11Clipboard:
-    """The X11 CLIPBOARD selection, read on demand and owned in a thread."""
+class XFixesSelectionNotifyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", Window),
+        ("subtype", ctypes.c_int),
+        ("owner", Window),
+        ("selection", Atom),
+        ("timestamp", Time),
+        ("selection_timestamp", Time),
+    ]
 
-    TEXT_TARGETS = (b"UTF8_STRING", b"text/plain;charset=utf-8", b"text/plain", b"STRING", b"TEXT")
 
-    def __init__(self, display: str, timeout: float = 1.0):
+XFixesSetSelectionOwnerNotifyMask = 1
+XFixesSelectionNotify = 0
+
+
+def _load_xfixes():
+    x = ctypes.CDLL(ctypes.util.find_library("Xfixes") or "libXfixes.so.3")
+    x.XFixesQueryExtension.restype = ctypes.c_int
+    x.XFixesQueryExtension.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    x.XFixesSelectSelectionInput.restype = None
+    x.XFixesSelectSelectionInput.argtypes = [ctypes.c_void_p, Window, Atom, ctypes.c_ulong]
+    return x
+
+
+def gamescope_displays(socket_dir: pathlib.Path = pathlib.Path("/tmp/.X11-unix")) -> list[str]:
+    """X displays with a socket (gamescope runs one Xwayland per display)."""
+    if not socket_dir.is_dir():
+        return []
+    return sorted(
+        f":{p.name[1:]}" for p in socket_dir.iterdir() if p.name[:1] == "X" and p.name[1:].isdigit()
+    )
+
+
+class ClipboardHub:
+    """One clipboard for Android and every gamescope X display.
+
+    gamescope's VR backend does not sync the X11 clipboard between its
+    Xwayland servers (OpenVRBackend SetSelection does nothing), so the hub
+    does: when an app on one display copies, it reads the text once and
+    owns CLIPBOARD on every other display; when Android copies, it owns
+    CLIPBOARD everywhere. Android pastes get the current text directly.
+    """
+
+    def __init__(self, displays=gamescope_displays, rescan_seconds: float = 10.0):
         self.x = _load_x11()
-        self.display = display.encode()
-        self.timeout = timeout
+        self.xfixes = _load_xfixes()
+        self._find_displays = displays
         self._lock = threading.Lock()
-        self._text: bytes | None = None  # what we serve while we own CLIPBOARD
-        self._wake_r, self._wake_w = os.pipe()
-        self._owner = threading.Thread(target=self._serve, name="x11-owner", daemon=True)
-        self._owner.start()
+        self._text: bytes | None = None
+        self._source: str | None = None  # display that set the text, or None for Android
+        self._owners: dict[str, DisplayOwner] = {}
+        threading.Thread(
+            target=self._rescan_loop, args=(rescan_seconds,), name="x11-displays", daemon=True
+        ).start()
 
-    # Reading -----------------------------------------------------------------
-
+    # host interface used by ClipboardBridge
     def get(self) -> str | None:
         with self._lock:
-            if self._text is not None:
-                return self._text.decode(errors="replace")
-        dpy = self.x.XOpenDisplay(self.display)
+            return self._text.decode(errors="replace") if self._text is not None else None
+
+    def set(self, text: str) -> None:
+        self._publish(text.encode(), source=None)
+
+    # called by DisplayOwner threads
+    def copied_on(self, display: str, data: bytes) -> None:
+        if len(data) > MAX_BYTES:
+            log(f"{display}: clipboard of {len(data)} bytes exceeds the limit; not shared")
+            return
+        log(f"{display} -> clipboard: {len(data)} bytes")
+        self._publish(data, source=display)
+
+    def current(self) -> bytes | None:
+        with self._lock:
+            return self._text
+
+    def _publish(self, data: bytes, source: str | None) -> None:
+        with self._lock:
+            self._text, self._source = data, source
+            owners = list(self._owners.values())
+        for owner in owners:
+            if owner.display != source:
+                owner.take_ownership()
+
+    def _rescan_loop(self, every: float) -> None:
+        while True:
+            for display in self._find_displays():
+                with self._lock:
+                    known = display in self._owners and self._owners[display].alive()
+                if not known:
+                    owner = DisplayOwner(self, display)
+                    with self._lock:
+                        self._owners[display] = owner
+                    owner.start()
+            time.sleep(every)
+
+
+class DisplayOwner(threading.Thread):
+    """Serves the hub's text as CLIPBOARD on one X display and reports copies."""
+
+    def __init__(self, hub: ClipboardHub, display: str, timeout: float = 1.0):
+        super().__init__(name=f"x11{display}", daemon=True)
+        self.hub, self.display, self.timeout = hub, display, timeout
+        self.x = hub.x
+        self._wake_r, self._wake_w = os.pipe()
+        self._running = True
+
+    def alive(self) -> bool:
+        return self._running and self.is_alive()
+
+    def take_ownership(self) -> None:
+        os.write(self._wake_w, b"o")
+
+    def run(self) -> None:
+        try:
+            self._serve()
+        except OSError as e:
+            log(f"{self.display}: {e}")
+        finally:
+            self._running = False
+
+    def _serve(self) -> None:
+        x, xf = self.x, self.hub.xfixes
+        dpy = x.XOpenDisplay(self.display.encode())
         if not dpy:
-            raise OSError(f"cannot open X display {self.display.decode()}")
+            raise OSError("cannot open display")
+        try:
+            root = x.XDefaultRootWindow(dpy)
+            win = x.XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0)
+            names = (b"CLIPBOARD", b"TARGETS", *TEXT_TARGETS)
+            atoms = {n: x.XInternAtom(dpy, n, 0) for n in names}
+            event_base, error_base = ctypes.c_int(), ctypes.c_int()
+            if not xf.XFixesQueryExtension(dpy, ctypes.byref(event_base), ctypes.byref(error_base)):
+                raise OSError("no XFixes extension")
+            xf.XFixesSelectSelectionInput(
+                dpy, root, atoms[b"CLIPBOARD"], XFixesSetSelectionOwnerNotifyMask
+            )
+            # Send the request now: the loop below waits on the socket, and
+            # Xlib only flushes its output buffer when asked.
+            x.XFlush(dpy)
+            limit = x.XMaxRequestSize(dpy) * 4 - 1024
+            fd = x.XConnectionNumber(dpy)
+            ev = XEvent()
+            log(f"{self.display}: watching the clipboard")
+            if self.hub.current() is not None:
+                self.take_ownership()
+            while True:
+                ready, _, _ = select.select([fd, self._wake_r], [], [])
+                if self._wake_r in ready:
+                    os.read(self._wake_r, 64)
+                    x.XSetSelectionOwner(dpy, atoms[b"CLIPBOARD"], win, CurrentTime)
+                    x.XFlush(dpy)
+                while x.XPending(dpy):
+                    x.XNextEvent(dpy, ctypes.byref(ev))
+                    if ev.type == SelectionRequest:
+                        self._answer(dpy, ev.xselectionrequest, atoms, limit)
+                    elif ev.type == event_base.value + XFixesSelectionNotify:
+                        note = ctypes.cast(
+                            ctypes.byref(ev), ctypes.POINTER(XFixesSelectionNotifyEvent)
+                        ).contents
+                        if note.owner not in (0, win):
+                            data = self._read_selection()
+                            if data:
+                                self.hub.copied_on(self.display, data)
+        finally:
+            x.XCloseDisplay(dpy)
+
+    def _answer(self, dpy, req: XSelectionRequestEvent, atoms: dict, limit: int) -> None:
+        x = self.x
+        text = self.hub.current()
+        prop = req.property or req.target
+        ok = False
+        if text is not None and req.target == atoms[b"TARGETS"]:
+            targets = (Atom * (1 + len(TEXT_TARGETS)))(
+                atoms[b"TARGETS"], *(atoms[t] for t in TEXT_TARGETS)
+            )
+            x.XChangeProperty(
+                dpy, req.requestor, prop, XA_ATOM, 32, PropModeReplace, targets, len(targets)
+            )
+            ok = True
+        elif text is not None and req.target in {atoms[t] for t in TEXT_TARGETS}:
+            if len(text) <= limit:
+                buf = ctypes.create_string_buffer(text, len(text))
+                x.XChangeProperty(
+                    dpy, req.requestor, prop, req.target, 8, PropModeReplace, buf, len(text)
+                )
+                ok = True
+            else:
+                log(f"{self.display}: clipboard of {len(text)} bytes exceeds the X request limit")
+        reply = XEvent()
+        reply.xselection.type = SelectionNotify
+        reply.xselection.requestor = req.requestor
+        reply.xselection.selection = req.selection
+        reply.xselection.target = req.target
+        reply.xselection.property = prop if ok else 0
+        reply.xselection.time = req.time
+        x.XSendEvent(dpy, req.requestor, 0, 0, ctypes.byref(reply))
+        x.XFlush(dpy)
+
+    def _read_selection(self) -> bytes | None:
+        """Read CLIPBOARD on this display over a separate connection."""
+        try:
+            return SelectionReader(self.x, self.display, self.timeout).read()
+        except OSError as e:
+            log(f"{self.display}: cannot read the clipboard: {e}")
+            return None
+
+
+TEXT_TARGETS = (b"UTF8_STRING", b"text/plain;charset=utf-8", b"text/plain", b"STRING", b"TEXT")
+
+
+class SelectionReader:
+    """Reads the current CLIPBOARD text from one X display (INCR supported)."""
+
+    def __init__(self, x, display: str, timeout: float):
+        self.x, self.display, self.timeout = x, display, timeout
+
+    def read(self) -> bytes | None:
+        dpy = self.x.XOpenDisplay(self.display.encode())
+        if not dpy:
+            raise OSError("cannot open display")
         try:
             return self._read(dpy)
         finally:
             self.x.XCloseDisplay(dpy)
 
-    def _read(self, dpy) -> str | None:
+    def _read(self, dpy) -> bytes | None:
         x = self.x
         root = x.XDefaultRootWindow(dpy)
         win = x.XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0)
@@ -247,8 +455,7 @@ class X11Clipboard:
                 raise OSError("clipboard owner did not answer")
             if ev.xselection.property == 0:
                 continue  # owner refused this target
-            data = self._read_property(dpy, win, prop)
-            return data.decode(errors="replace") if data is not None else None
+            return self._read_property(dpy, win, prop)
         return None
 
     def _read_property(self, dpy, win, prop) -> bytes | None:
@@ -322,86 +529,6 @@ class X11Clipboard:
             if remaining <= 0:
                 return None
             select.select([fd], [], [], remaining)
-
-    # Owning --------------------------------------------------------------------
-
-    def set(self, text: str) -> None:
-        with self._lock:
-            self._text = text.encode()
-        os.write(self._wake_w, b"o")
-
-    def _serve(self) -> None:
-        while True:
-            try:
-                self._serve_once()
-            except OSError as e:
-                log(f"X11 clipboard owner: {e}; retrying in 5 s")
-                time.sleep(5)
-
-    def _serve_once(self) -> None:
-        x = self.x
-        dpy = x.XOpenDisplay(self.display)
-        if not dpy:
-            raise OSError(f"cannot open X display {self.display.decode()}")
-        try:
-            root = x.XDefaultRootWindow(dpy)
-            win = x.XCreateSimpleWindow(dpy, root, 0, 0, 1, 1, 0, 0, 0)
-            atoms = {
-                n: x.XInternAtom(dpy, n, 0) for n in (b"CLIPBOARD", b"TARGETS", *self.TEXT_TARGETS)
-            }
-            limit = x.XMaxRequestSize(dpy) * 4 - 1024
-            fd = x.XConnectionNumber(dpy)
-            ev = XEvent()
-            while True:
-                ready, _, _ = select.select([fd, self._wake_r], [], [])
-                if self._wake_r in ready:
-                    os.read(self._wake_r, 64)
-                    x.XSetSelectionOwner(dpy, atoms[b"CLIPBOARD"], win, CurrentTime)
-                    x.XFlush(dpy)
-                    if x.XGetSelectionOwner(dpy, atoms[b"CLIPBOARD"]) != win:
-                        log("could not take the X11 clipboard")
-                while x.XPending(dpy):
-                    x.XNextEvent(dpy, ctypes.byref(ev))
-                    if ev.type == SelectionClear:
-                        with self._lock:
-                            self._text = None  # another app copied
-                    elif ev.type == SelectionRequest:
-                        self._answer(dpy, ev.xselectionrequest, atoms, limit)
-        finally:
-            x.XCloseDisplay(dpy)
-
-    def _answer(self, dpy, req: XSelectionRequestEvent, atoms: dict, limit: int) -> None:
-        x = self.x
-        with self._lock:
-            text = self._text
-        prop = req.property or req.target
-        ok = False
-        if text is not None and req.target == atoms[b"TARGETS"]:
-            targets = (Atom * (1 + len(self.TEXT_TARGETS)))(
-                atoms[b"TARGETS"], *(atoms[t] for t in self.TEXT_TARGETS)
-            )
-            x.XChangeProperty(
-                dpy, req.requestor, prop, XA_ATOM, 32, PropModeReplace, targets, len(targets)
-            )
-            ok = True
-        elif text is not None and req.target in {atoms[t] for t in self.TEXT_TARGETS}:
-            if len(text) <= limit:
-                buf = ctypes.create_string_buffer(text, len(text))
-                x.XChangeProperty(
-                    dpy, req.requestor, prop, req.target, 8, PropModeReplace, buf, len(text)
-                )
-                ok = True
-            else:
-                log(f"clipboard of {len(text)} bytes exceeds the X request limit")
-        reply = XEvent()
-        reply.xselection.type = SelectionNotify
-        reply.xselection.requestor = req.requestor
-        reply.xselection.selection = req.selection
-        reply.xselection.target = req.target
-        reply.xselection.property = prop if ok else 0
-        reply.xselection.time = req.time
-        x.XSendEvent(dpy, req.requestor, 0, 0, ctypes.byref(reply))
-        x.XFlush(dpy)
 
 
 # --- HIDL service over the container's hwbinder (libgbinder) ----------------
@@ -553,9 +680,8 @@ def main() -> int:
     libdir = pathlib.Path(
         os.environ.get("WGAPPS_LIB", pathlib.Path(__file__).resolve().parent.parent / "lib")
     )
-    display = os.environ.get("WGAPPS_DISPLAY") or os.environ.get("DISPLAY") or ":0"
     try:
-        bridge = ClipboardBridge(X11Clipboard(display))
+        bridge = ClipboardBridge(ClipboardHub())
         service = HidlClipboardService(libdir, bridge)
         if not wait_for_boot(container):
             log("Android did not finish booting; clipboard not shared")
