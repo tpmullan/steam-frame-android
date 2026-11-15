@@ -32,6 +32,12 @@ c=$(podman create ghcr.io/tpmullan/steam-frame-android:latest none) \
 adds an **Android** entry to the Steam library (close Steam first, or add it
 later as printed).
 
+For Android without Google apps, run `wgapps install --vanilla` instead (the
+choice is remembered). To switch an existing install, run it again with the
+other flag and expect a fresh Android: apps and data from the other image
+are not carried over cleanly, so remove `~/.local/share/waydroid-gapps/data`
+first if you want a clean start.
+
 Then:
 
 1. Launch **Android** from Steam. The first boot takes about a minute.
@@ -88,11 +94,12 @@ from Waydroid under their own terms and are not part of this project.
   virtual Xbox pad; `bin/wgapps-ota` resolves Waydroid builds;
   `bin/wgapps-gen-overrides` derives the two vendor fixes from the
   installed image; `overrides/` holds our own init and network files.
-- Tests: `cd tests && python3 -m unittest -v`. Lint: shellcheck, shfmt,
-  ruff. CI runs on GitLab (`.gitlab-ci.yml`).
+- Tests: `cd tests && python3 -m unittest -v` (needs git). Lint: shellcheck,
+  shfmt, ruff. CI runs on GitLab (`.gitlab-ci.yml`).
 - `tools/deploy.sh` copies a checkout to a Frame over SSH in the release
   layout.
-- Releases: development happens in a separate repository. A release tag
-  there runs CI, which publishes `ghcr.io/tpmullan/steam-frame-android:vX.Y.Z`
-  and `:latest` and pushes one snapshot commit per release here
-  (`tools/release.sh`).
+- Releases: development happens in a separate repository. Pushing a
+  `vX.Y.Z` tag there builds and checks the image, publishes it as
+  `ghcr.io/tpmullan/steam-frame-android:vX.Y.Z` (and `:latest` when it is
+  the newest release), then pushes one snapshot commit and the tag here
+  (`tools/sfa_release.py`).

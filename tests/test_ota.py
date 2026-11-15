@@ -29,6 +29,15 @@ VENDOR = {
 }
 
 
+class FlavorTests(unittest.TestCase):
+    def test_index_url_follows_the_flavor_and_defaults_to_gapps(self):
+        base = "https://ota.waydro.id/system/lineage/waydroid_arm64_only"
+        self.assertEqual(ota.system_index_url("waydroid_arm64_only"), f"{base}/GAPPS.json")
+        self.assertEqual(
+            ota.system_index_url("waydroid_arm64_only", "VANILLA"), f"{base}/VANILLA.json"
+        )
+
+
 class ResolveTests(unittest.TestCase):
     def test_newest_build_present_in_both_indexes(self):
         build, sysent, venent = ota.resolve(SYSTEM, VENDOR)

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Resumable download of Waydroid's LineageOS 20 GAPPS images for 64-bit-only
+# Resumable download of Waydroid's LineageOS 20 images (GAPPS or VANILLA) for 64-bit-only
 # ARM CPUs (the Frame's SM8650 has no AArch32), straight from Waydroid's
 # servers. URLs and SHA-256 come from Waydroid's OTA index (wgapps-ota).
 # Retries across drops, stalls and sleep/wake; writes DONE only once both
@@ -10,6 +10,11 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="${WGAPPS_BASE:-$HOME/.local/share/waydroid-gapps}/images"
 VARIANT="${WGAPPS_VARIANT:-waydroid_arm64_only}"
+# GAPPS (with Google apps) or VANILLA (without); install records the choice.
+FLAVOR="${WGAPPS_FLAVOR:-$(cat "$DIR/../flavor" 2>/dev/null || echo GAPPS)}"
+# GAPPS keeps the marker it always had, so existing installs do not re-download.
+KEY="$VARIANT"
+[[ "$FLAVOR" == "GAPPS" ]] || KEY="$VARIANT $FLAVOR"
 
 log() { printf "%s %s\n" "$(date "+%F %T")" "$*"; }
 die() {
@@ -17,7 +22,7 @@ die() {
 	exit 1
 }
 
-ota_args=(--variant "$VARIANT")
+ota_args=(--variant "$VARIANT" --flavor "$FLAVOR")
 [[ -n "${WGAPPS_BUILD:-}" ]] && ota_args+=(--build "$WGAPPS_BUILD")
 resolved="$(python3 "$HERE/wgapps-ota" "${ota_args[@]}")" || die "cannot resolve Waydroid images"
 BUILD="" SYSTEM_URL="" SYSTEM_SHA256="" VENDOR_URL="" VENDOR_SHA256=""
@@ -50,16 +55,16 @@ fetch() {
 	log "$out: verified ($sha)"
 }
 
-if [[ -f DONE && "$(cat variant 2>/dev/null)" == "$VARIANT $BUILD" ]]; then
+if [[ -f DONE && "$(cat variant 2>/dev/null)" == "$KEY $BUILD" ]]; then
 	log "build $BUILD already downloaded"
 	exit 0
 fi
 rm -f DONE
 # A different build: start the archives over.
-if [[ "$(cat variant.wanted 2>/dev/null)" != "$VARIANT $BUILD" ]]; then
+if [[ "$(cat variant.wanted 2>/dev/null)" != "$KEY $BUILD" ]]; then
 	rm -f system.zip vendor.zip
 fi
-echo "$VARIANT $BUILD" >variant.wanted
+echo "$KEY $BUILD" >variant.wanted
 fetch vendor.zip "$VENDOR_URL" "$VENDOR_SHA256"
 fetch system.zip "$SYSTEM_URL" "$SYSTEM_SHA256"
 rm -f system.img vendor.img

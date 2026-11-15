@@ -12,6 +12,7 @@ SHA-256 of the zip. Google apps are never hosted by this project: the user's
 Frame downloads them from Waydroid's servers.
 
 Usage: wgapps-ota [--build YYYYMMDD] [--variant waydroid_arm64_only]
+                  [--flavor GAPPS|VANILLA]
                   [--system-index FILE_OR_URL] [--vendor-index FILE_OR_URL]
 """
 
@@ -26,8 +27,11 @@ OTA = "https://ota.waydro.id"
 BUILD_RE = re.compile(r"-(\d{8})-")
 
 
-def system_index_url(variant):
-    return f"{OTA}/system/lineage/{variant}/GAPPS.json"
+FLAVORS = ("GAPPS", "VANILLA")
+
+
+def system_index_url(variant, flavor="GAPPS"):
+    return f"{OTA}/system/lineage/{variant}/{flavor}.json"
 
 
 def vendor_index_url(variant):
@@ -73,12 +77,13 @@ def main(argv):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--build")
     p.add_argument("--variant", default="waydroid_arm64_only")
+    p.add_argument("--flavor", choices=FLAVORS, default="GAPPS")
     p.add_argument("--system-index")
     p.add_argument("--vendor-index")
     a = p.parse_args(argv)
     try:
         build, sysent, venent = resolve(
-            load(a.system_index or system_index_url(a.variant)),
+            load(a.system_index or system_index_url(a.variant, a.flavor)),
             load(a.vendor_index or vendor_index_url(a.variant)),
             a.build,
         )
