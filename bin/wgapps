@@ -509,6 +509,10 @@ cmd_install() {
 		# Valve's profile for Android in rootless podman on this kernel; used
 		# when Lepton is installed, otherwise podman's default profile.
 		cp "$LEPTON_SECCOMP" "$BASE/lepton.seccomp.json"
+		log "Lepton found: using Valve's seccomp profile for Android"
+	else
+		rm -f "$BASE/lepton.seccomp.json"
+		log "Lepton not installed: using wgapps' own seccomp profile (both boot Android)"
 	fi
 	if [[ "$flavor" == "VANILLA" ]]; then
 		log "downloading Waydroid's images without Google apps from Waydroid (about 1 GB)"

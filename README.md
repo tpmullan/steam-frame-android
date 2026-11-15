@@ -77,8 +77,14 @@ $W uninstall --yes   # removes everything, including Android data
 - Video decodes in software (fine for 1080p H.264/HEVC). Hardware decoding
   needs a V4L2 Codec2 HAL and is planned.
 - Netflix and other Widevine L1 apps do not work (uncertified device).
-- If Valve's Lepton is installed, its seccomp profile is used; otherwise
-  wgapps writes its own (podman's default profile stops Android booting).
+- Lepton is optional. `wgapps install` uses Valve's seccomp profile for Android
+  when Lepton is installed at that moment, and otherwise writes its own: it
+  allows everything except kernel modules, kexec, `open_by_handle_at` and
+  changing the clock, and answers `setpriority`/`nice` with success, which
+  Android needs to boot (podman's default profile blocks it and Android never
+  finishes booting). Android boots either way. To switch, install or remove
+  Lepton and run `wgapps install` again; it picks the profile to use and says
+  which. Valve's profile follows their testing; ours is the minimum that boots.
 - Some apps crash in the background on push notifications (Plex 2026.19);
   dismiss the dialog.
 
