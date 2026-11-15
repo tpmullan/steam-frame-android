@@ -193,6 +193,32 @@ bind() {
 	ARGS+=(--mount "type=bind,source=$src,destination=$dst,$opt")
 }
 
+# Seccomp profile for Android in the container when Lepton's is not installed:
+# everything is allowed except what a container has no business doing (kernel
+# modules, kexec, changing the clock) and open_by_handle_at. Calls a rootless
+# container is not allowed to make but Android makes at boot (setpriority,
+# nice, the clock) are answered with success instead of EPERM; with EPERM init
+# cannot start zygote and Android never finishes booting.
+write_seccomp() {
+	local out="$RUNDIR/android.seccomp.json"
+	cat >"$out" <<'JSON'
+{
+  "defaultAction": "SCMP_ACT_ALLOW",
+  "syscalls": [
+    {"names": ["open_by_handle_at"], "action": "SCMP_ACT_ERRNO", "errnoRet": 38},
+    {"names": ["adjtimex", "clock_adjtime", "clock_adjtime64", "clock_settime",
+               "clock_settime64", "settimeofday", "swapon", "swapoff", "setpriority",
+               "nice", "keyctl", "request_key"],
+     "action": "SCMP_ACT_ERRNO", "errnoRet": 0},
+    {"names": ["init_module", "finit_module", "delete_module", "_sysctl",
+               "kexec_file_load", "kexec_load", "reboot"],
+     "action": "SCMP_ACT_ERRNO"}
+  ]
+}
+JSON
+	echo "$out"
+}
+
 cmd_start() {
 	local headless=false
 	[[ "${1:-}" == "--headless" ]] && headless=true
@@ -237,9 +263,11 @@ cmd_start() {
 		ipc_lock sys_chroot; do
 		ARGS+=(--cap-add "$cap")
 	done
-	if [[ -f "$seccomp" ]]; then
-		ARGS+=(--security-opt "seccomp=$seccomp")
-	fi
+	# Without Lepton's profile podman's default one applies, and it refuses
+	# setpriority/nice: init cannot start zygote and Android never finishes
+	# booting. Use our own profile instead.
+	[[ -f "$seccomp" ]] || seccomp="$(write_seccomp)"
+	ARGS+=(--security-opt "seccomp=$seccomp")
 	# shellcheck disable=SC2054 # commas are mount options, not separators
 	ARGS+=(
 		--tmpfs /dev:rw,nosuid,U

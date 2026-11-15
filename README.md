@@ -78,7 +78,7 @@ $W uninstall --yes   # removes everything, including Android data
   needs a V4L2 Codec2 HAL and is planned.
 - Netflix and other Widevine L1 apps do not work (uncertified device).
 - If Valve's Lepton is installed, its seccomp profile is used; otherwise
-  podman's default profile.
+  wgapps writes its own (podman's default profile stops Android booting).
 - Some apps crash in the background on push notifications (Plex 2026.19);
   dismiss the dialog.
 
