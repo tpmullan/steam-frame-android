@@ -155,6 +155,15 @@ def deny_hits(commit: str, deny_file: str, cwd: str | None = None) -> str:
     return res.stdout
 
 
+def deny_hits_text(text: str, deny_file: str | os.PathLike) -> bool:
+    """True when TEXT matches a deny-list pattern."""
+    for line in pathlib.Path(deny_file).read_text().splitlines():
+        pat = line.strip()
+        if pat and not pat.startswith("#") and re.search(pat, text):
+            return True
+    return False
+
+
 def release(
     version: str,
     commit: str = "HEAD",
@@ -163,7 +172,11 @@ def release(
     dry_run: bool = False,
     cwd: str | None = None,
 ) -> dict:
-    """Push one snapshot commit (tree of COMMIT) plus the tag to the public repo.
+    """Push COMMIT (or, with unrelated histories, one snapshot of its tree) and the tag.
+
+    When the public main is an ancestor of COMMIT the histories are one, and
+    COMMIT is pushed as it is; otherwise a snapshot commit is made on top of
+    the public main.
 
     The tag is force-updated, so a re-run re-publishes. The public main branch
     moves only when VERSION is the highest release (or equal); an older
@@ -186,7 +199,23 @@ def release(
     message = f"Release {version}"
     if heads:
         run("git", "fetch", "-q", remote, f"+refs/heads/main:{public_ref}", cwd=cwd)
-        if run("git", "rev-parse", f"{public_ref}^{{tree}}", cwd=cwd).strip() == tree:
+        shared = (
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", public_ref, commit], cwd=cwd, check=False
+            ).returncode
+            == 0
+        )
+        if shared:
+            # One history: the public repo is an ancestor of COMMIT, so publish
+            # COMMIT itself. Every commit that becomes public is checked too.
+            snapshot = run("git", "rev-parse", f"{commit}^{{commit}}", cwd=cwd).strip()
+            for new in run("git", "rev-list", f"{public_ref}..{commit}", cwd=cwd).split():
+                hits = deny_hits(new, deny_file, cwd=cwd)
+                if hits:
+                    raise ReleaseError(f"commit {new[:12]} matches the deny-list:\n{hits}")
+                if deny_hits_text(run("git", "log", "-1", "--format=%B", new, cwd=cwd), deny_file):
+                    raise ReleaseError(f"commit {new[:12]} message matches the deny-list")
+        elif run("git", "rev-parse", f"{public_ref}^{{tree}}", cwd=cwd).strip() == tree:
             snapshot = run("git", "rev-parse", public_ref, cwd=cwd).strip()
         else:
             snapshot = run("git", "commit-tree", tree, "-p", public_ref, "-m", message, cwd=cwd)

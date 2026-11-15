@@ -111,6 +111,24 @@ class ReleaseTests(unittest.TestCase):
             self.pub("rev-parse", "v0.1.1^{tree}"), self.git("rev-parse", "HEAD^{tree}")
         )
 
+    def test_shared_history_publishes_the_commit_itself(self):
+        self.commit("file.txt", "one\n")
+        self.git("push", "-q", self.public, "HEAD:refs/heads/main")
+        self.commit("file.txt", "two\n")
+        head = self.git("rev-parse", "HEAD")
+        self.release("v0.4.0")
+        self.assertEqual(self.pub("rev-parse", "main"), head)
+        self.assertEqual(self.pub("rev-parse", "v0.4.0^{commit}"), head)
+        self.assertEqual(self.pub("rev-list", "--count", "main"), "2")
+
+    def test_shared_history_checks_new_commit_messages(self):
+        self.commit("file.txt", "one\n")
+        self.git("push", "-q", self.public, "HEAD:refs/heads/main")
+        pathlib.Path(self.dev, "file.txt").write_text("two\n")
+        self.git("commit", "-q", "-am", "talks to host.internal.example")
+        with self.assertRaises(rel.ReleaseError):
+            self.release("v0.5.0")
+
     def test_rerun_same_version_republishes(self):
         self.commit("file.txt", "three\n")
         self.release("v0.3.0")
