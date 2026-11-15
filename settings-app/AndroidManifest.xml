@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A system app (bin/wgapps mounts it under /system/priv-app): Android's Settings lists extra screens
+     only from system apps. It needs no permissions of its own: it reads and writes one file in the
+     folder shared with the host. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.wgapps.settings">
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+    <application android:label="Device profiles" android:allowBackup="false"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight">
+        <activity android:name=".AppListActivity" android:exported="true" android:label="Device profile per app">
+            <intent-filter>
+                <action android:name="com.android.settings.action.EXTRA_SETTINGS" />
+            </intent-filter>
+            <meta-data android:name="com.android.settings.category" android:value="com.android.settings.category.ia.system" />
+            <meta-data android:name="com.android.settings.title" android:value="Device profile per app" />
+            <meta-data android:name="com.android.settings.summary" android:value="Make an app see another device model" />
+            <meta-data android:name="com.android.settings.icon" android:resource="@drawable/ic_profile" />
+            <meta-data android:name="com.android.settings.icon_tintable" android:value="true" />
+        </activity>
+        <!-- Writes app-labels.conf for the host's app catalog: at boot, and when wgapps asks. -->
+        <receiver android:name=".LabelsReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+        <activity android:name=".ProfileActivity" android:exported="false" android:label="Device profile"
+            android:parentActivityName=".AppListActivity" />
+    </application>
+</manifest>

@@ -100,7 +100,8 @@ def to_android(state: dict) -> dict[str, int]:
     }
     if battery["temp"] is not None:
         values["temp"] = battery["temp"]
-    if battery["counter"] is not None:
+    # Some fuel gauges report a signed counter; Android expects remaining uAh.
+    if battery["counter"] is not None and battery["counter"] > 0:
         values["counter"] = battery["counter"]
     return values
 

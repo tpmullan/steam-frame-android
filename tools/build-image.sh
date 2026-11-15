@@ -2,7 +2,8 @@
 # Build the release image (FROM scratch file bundle, linux/arm64) into an
 # OCI archive without pushing it anywhere. The version is stamped into a
 # temporary copy of the build context, so the repository stays unchanged.
-# Needs lib/ from tools/build-libgbinder.sh (the CI libgbinder job artifact).
+# Needs lib/ from tools/build-libgbinder.sh and tools/build-android-libs.sh
+# (the CI libgbinder and android-libs job artifacts).
 #
 # Usage: tools/build-image.sh <version> <output.tar>
 # Optional environment: IMAGE_SOURCE (org.opencontainers.image.source),
@@ -17,6 +18,12 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 	echo "build-image: missing lib/libgbinder.so.1; run tools/build-libgbinder.sh lib" >&2
 	exit 1
 }
+for lib in libwgapps_xr_gles.so libwgapps_gbm_lock.so libwgapps_props.so; do
+	[[ -f "$root/lib/$lib" ]] || {
+		echo "build-image: missing lib/$lib; run tools/build-android-libs.sh lib" >&2
+		exit 1
+	}
+done
 ctx="$(mktemp -d)"
 trap 'rm -rf "$ctx"' EXIT
 cp -R "$root/bin" "$root/lib" "$root/overrides" "$root/LICENSE" "$root/Containerfile" "$ctx/"

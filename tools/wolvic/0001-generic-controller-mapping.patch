@@ -1,0 +1,78 @@
+diff --git a/app/src/openxr/cpp/DeviceDelegateOpenXR.cpp b/app/src/openxr/cpp/DeviceDelegateOpenXR.cpp
+index ab86951..62f35be 100644
+--- a/app/src/openxr/cpp/DeviceDelegateOpenXR.cpp
++++ b/app/src/openxr/cpp/DeviceDelegateOpenXR.cpp
+@@ -179,6 +179,10 @@ struct DeviceDelegateOpenXR::State {
+             extensions.push_back(XR_MSFT_HAND_TRACKING_MESH_EXTENSION_NAME);
+         }
+     }
++    // Newer than the OpenXR headers Wolvic builds against, so spelled out here.
++    if (OpenXRExtensions::IsExtensionSupported("XR_KHR_generic_controller")) {
++        extensions.push_back("XR_KHR_generic_controller");
++    }
+     if (OpenXRExtensions::IsExtensionSupported(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME)) {
+         extensions.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+     }
+diff --git a/app/src/openxr/cpp/OpenXRInputMappings.h b/app/src/openxr/cpp/OpenXRInputMappings.h
+index 4be75f2..4d7f8e4 100644
+--- a/app/src/openxr/cpp/OpenXRInputMappings.h
++++ b/app/src/openxr/cpp/OpenXRInputMappings.h
+@@ -34,6 +34,8 @@ namespace crow {
+     constexpr const char* kPathSelect { "input/select" };
+     constexpr const char* kPathMenu { "input/menu" };
+     constexpr const char* kPathBack { "input/back" };
++    constexpr const char* kPathPrimary { "input/primary" };
++    constexpr const char* kPathSecondary { "input/secondary" };
+     constexpr const char* kPathHaptic { "output/haptic" };
+     constexpr const char* kPathButtonA { "input/a" };
+     constexpr const char* kPathButtonB { "input/b" };
+@@ -46,6 +48,7 @@ namespace crow {
+     constexpr const char* kPathActionValue { "value" };
+     constexpr const char* kPathActionReady { "ready_ext" };
+     constexpr const char* kInteractionProfileHandInteraction { "/interaction_profiles/ext/hand_interaction_ext" };
++    constexpr const char* kInteractionProfileKHRGenericController { "/interaction_profiles/khr/generic_controller" };
+     constexpr const char* kInteractionProfileMSFTHandInteraction { "/interaction_profiles/microsoft/hand_interaction" };
+ 
+     // OpenXR Button List
+@@ -508,6 +511,30 @@ namespace crow {
+             {}
+     };
+ 
++    // XR_KHR_generic_controller: what runtimes offer for controllers an app has no profile for
++    // (SteamVR's Steam Frame controllers, for one). It has no menu button, so KHRSimple stays
++    // alongside it for that.
++    const OpenXRInputMapping KHRGenericController {
++            kInteractionProfileKHRGenericController,
++            "generic-trigger.obj",
++            "generic-trigger.obj",
++            device::UnknownType,
++            std::vector<OpenXRInputProfile> { "generic-trigger-squeeze-thumbstick", "generic-trigger-squeeze", "generic-trigger" },
++            std::vector<OpenXRButton> {
++                    { OpenXRButtonType::Trigger, kPathTrigger, OpenXRButtonFlags::Value, OpenXRHandFlags::Both },
++                    { OpenXRButtonType::Squeeze, kPathSqueeze, OpenXRButtonFlags::Value, OpenXRHandFlags::Both },
++                    { OpenXRButtonType::Thumbstick, kPathThumbstick, OpenXRButtonFlags::Click, OpenXRHandFlags::Both },
++                    { OpenXRButtonType::ButtonA, kPathPrimary, OpenXRButtonFlags::Click, OpenXRHandFlags::Both },
++                    { OpenXRButtonType::ButtonB, kPathSecondary, OpenXRButtonFlags::Click, OpenXRHandFlags::Both },
++            },
++            std::vector<OpenXRAxis> {
++                    { OpenXRAxisType::Thumbstick, kPathThumbstick, OpenXRHandFlags::Both },
++            },
++            std::vector<OpenXRHaptic> {
++                    { kPathHaptic, OpenXRHandFlags::Both },
++            },
++    };
++
+     // Default fallback: https://github.com/immersive-web/webxr-input-profiles/blob/master/packages/registry/profiles/generic/generic-button.json
+     const OpenXRInputMapping KHRSimple {
+             "/interaction_profiles/khr/simple_controller",
+@@ -525,8 +552,8 @@ namespace crow {
+             },
+     };
+ 
+-    const std::array<OpenXRInputMapping, 17> OpenXRInputMappings {
+-            OculusTouch, OculusTouch2, MetaQuestTouchPro, Pico4U, Pico4x, PicoNeo3, PfdmYVR1, PfdmYVR2, PfdmMR, Hvr6DOF, Hvr3DOF, LenovoVRX, MagicLeap2, MetaTouchPlus, HandInteraction, MSFTHandInteraction, KHRSimple
++    const std::array<OpenXRInputMapping, 18> OpenXRInputMappings {
++            OculusTouch, OculusTouch2, MetaQuestTouchPro, Pico4U, Pico4x, PicoNeo3, PfdmYVR1, PfdmYVR2, PfdmMR, Hvr6DOF, Hvr3DOF, LenovoVRX, MagicLeap2, MetaTouchPlus, HandInteraction, MSFTHandInteraction, KHRGenericController, KHRSimple
+     };
+ 
+ } // namespace crow

@@ -16,6 +16,7 @@ DATA="$BASE/data"
 RUNDIR="$BASE/run"
 SHARE="$BASE/share"
 BIN="$BASE/bin"
+APPS_CONF="$BASE/apps.conf"
 NAME="waydroid-gapps"
 DEFAULT_IMAGE="ghcr.io/tpmullan/steam-frame-android"
 ADB_PORT="${WGAPPS_ADB_PORT:-5556}"
@@ -51,6 +52,24 @@ usage: wgapps <command> [args]
   logcat [args...]     Android logcat
   launch <package>     start or reuse Android, open the package's launcher activity
   run <package>        launch, then block until the app's process exits
+  app set <package> <key> <value>
+                       make one app see a different device property (keys: model,
+                       manufacturer, brand, device), e.g.
+                       app set com.igalia.wolvic.vanilla model "Quest 3"
+  app unset <package> [key]   undo it (all of the package's keys without a key)
+  app list             show the per-app overrides
+  app import <file>    replace them with the valid lines of a file (what the
+                       "Device profile per app" screen in Android's Settings does)
+  apps list            the apps you can open: package, label, activity, kind (xr or 2d)
+  apps sync            make the Steam library match: one entry per app, gone apps removed
+  apps kind <package> xr|2d|auto
+                       treat an app as OpenXR or flat whatever detection says
+  windows [floating|single]
+                       show or set how apps open: floating = movable windows inside
+                       Android's one panel, single = each app fills it (restart Android)
+  gpu egl [mesa|angle] show or set the GLES implementation (default mesa; restart Android)
+  report [file]        write a diagnostics file to attach to a bug report (no
+                       passwords or account data; see docs/runbook-logs.md)
   steam [package]      Steam shortcut entry point: (re)start Android under Steam's
                        reaper so gamescope ties the window to the Steam app, open
                        the package if given, block until Steam quits it
@@ -77,7 +96,7 @@ write_props() {
 		echo "ro.vndk.lite=true"
 		echo "ro.opengles.version=196609"
 		echo "ro.sf.lcd_density=${WGAPPS_DENSITY:-240}"
-		echo "ro.hardware.egl=mesa"
+		echo "ro.hardware.egl=$(gpu_egl)"
 		echo "ro.hardware.vulkan=freedreno"
 		echo "ro.hardware.gralloc=minigbm_gbm_mesa"
 		echo "ro.hardware.camera=v4l"
@@ -92,10 +111,16 @@ write_props() {
 		echo "waydroid.xdg_runtime_dir=/waydroid/xdg"
 		echo "waydroid.pulse_runtime_path=/waydroid/xdg/pulse"
 		echo "waydroid.stub_sensors_hal=1"
+		# Where Steam's client library lives (see mount_xr).
+		echo "lepton.steamclient.path=/system/lib64/libsteamclient.so"
 		# The Frame pointer arrives as a Wayland mouse; treat it as touch in every
 		# app so launcher and system gestures (swipe up for apps) work.
 		echo "persist.waydroid.fake_touch=${WGAPPS_FAKE_TOUCH:-*}"
 		echo "waydroid.wayland_display=wayland-0"
+		if [[ "$(windows_mode)" == "floating" ]]; then
+			# Tasks become freeform windows with caption buttons, all drawn into the one panel.
+			echo "persist.waydroid.multi_windows=true"
+		fi
 		if [[ "$headless" == "true" ]]; then
 			echo "waydroid.background_start=true"
 		else
@@ -103,6 +128,7 @@ write_props() {
 		fi
 		echo "persist.sys.timezone=$tz"
 		echo "service.adb.tcp.port=$ADB_PORT"
+		app_wrap_props
 		if [[ -f "$BASE/device.prop" ]]; then
 			cat "$BASE/device.prop"
 		fi
@@ -219,6 +245,599 @@ JSON
 	echo "$out"
 }
 
+# Lepton-style XR plumbing, from the host's SteamOS install (nothing of
+# Valve's is shipped here). Each piece is skipped when absent; WGAPPS_XR=0
+# disables all of it.
+#   Steam: the Android client libraries from Steam's install, listed in
+#     public.libraries.txt so apps may load them.
+#   OpenXR: apps bring their own loader, which reads
+#     /vendor/etc/openxr/1/active_runtime.json. That names SteamVR's Android
+#     client (vrclient.so) in the host's SteamVR, mounted at /data/steamvr
+#     (/data is the one place outside an app's own directory it may dlopen
+#     from). vrclient reads its paths from the environment, which apps inherit
+#     from zygote.
+# Not ported: Valve's Vulkan layers (shader cache, foveation) and the OpenXR
+# layer manifest under /usr/share/guestos. Lepton loads them through a hook in
+# its patched image, and the OpenXR half without the Vulkan half breaks
+# swapchains.
+STEAM_ANDROID_LIBS="${WGAPPS_STEAM_ANDROID_LIBS:-$HOME/.local/share/Steam/androidarm64}"
+VRCLIENT=bin/androidarm64/vrclient.so
+XR_LAYER=libwgapps_xr_gles
+
+# Where the host's SteamVR keeps its runtime or config: the override if
+# set, else what SteamOS's `steamvr` command reports (as Lepton asks it).
+steamvr_dir() {
+	local override="$1" what="$2"
+	if [[ -n "$override" ]]; then
+		echo "$override"
+	elif command -v steamvr >/dev/null; then
+		steamvr "$what" 2>/dev/null || true
+	fi
+}
+
+mount_xr() {
+	[[ "${WGAPPS_XR:-1}" == "0" ]] && return 0
+	local lib name pub="$RUNDIR/public.libraries.txt"
+	mkdir -p "$RUNDIR"
+	if [[ -f "$STEAM_ANDROID_LIBS/libsteamclient.so" && -f "$ROOTFS/system/etc/public.libraries.txt" ]]; then
+		# Android only lets apps load libraries listed in public.libraries.txt.
+		cp "$ROOTFS/system/etc/public.libraries.txt" "$pub"
+		for lib in "$STEAM_ANDROID_LIBS"/*.so; do
+			name="${lib##*/}"
+			echo "$name nopreload" >>"$pub"
+			bind "$lib" "/system/lib64/$name" ro,U
+		done
+		bind "$pub" /system/etc/public.libraries.txt ro,U
+	fi
+
+	local runtime logs config
+	runtime="$(steamvr_dir "${WGAPPS_STEAMVR_RUNTIME:-}" path)"
+	if [[ -z "$runtime" || ! -f "$runtime/$VRCLIENT" ]]; then
+		log "SteamVR's Android client ($VRCLIENT) not found: apps get no OpenXR runtime"
+		return 0
+	fi
+	config="$(steamvr_dir "${WGAPPS_STEAMVR_CONFIG:-}" configpath)"
+	# vrclient fails (VRInitError_Init_NoLogPath) unless it can create its log.
+	# Lepton shares the host's SteamVR log directory, but there every app is
+	# the host user; here each has its own UID, so they get a directory of
+	# ours that any of them may write.
+	logs="$BASE/steamvr-logs"
+	mkdir -p "$logs"
+	chmod 1777 "$logs"
+	# podman creates the mount points under /data; the host user cannot once
+	# Android owns it.
+	bind "$runtime" /data/steamvr/runtime rw
+	bind "$logs" /data/steamvr/logs rw
+	[[ -n "$config" ]] && bind "$config" /data/steamvr/config ro
+
+	cat >"$RUNDIR/active_runtime.json" <<EOF
+{
+    "file_format_version": "1.0.0",
+    "runtime": {
+        "name": "steamvr",
+        "VALVE_runtime_is_steamvr": true,
+        "library_path": "/data/steamvr/runtime/$VRCLIENT"
+    }
+}
+EOF
+	bind "$RUNDIR/active_runtime.json" /vendor/etc/openxr/1/active_runtime.json ro
+	# The same runtime for apps that use OpenVR.
+	cat >"$RUNDIR/openvrpaths.vrpath" <<EOF
+{
+    "config": ["/data/steamvr/config"],
+    "external_drivers": null,
+    "jsonid": "vrpathreg",
+    "log": ["/data/steamvr/logs"],
+    "runtime": ["/data/steamvr/runtime"],
+    "version": 1
+}
+EOF
+	bind "$RUNDIR/openvrpaths.vrpath" /vendor/etc/openvrpaths.vrpath ro
+
+	# Our own OpenXR layer (xr-layer/) for OpenGL ES apps: SteamVR has no
+	# GL_RGBA8 swapchains, which Wolvic insists on, and cannot create the
+	# 16- and 24-bit depth ones it lists, which Khronos hello_xr picks.
+	# App loaders read implicit layers from /vendor/etc/openxr/1/api_layers.
+	if [[ -f "$BASE/lib/$XR_LAYER.so" ]]; then
+		bind "$BASE/lib/$XR_LAYER.so" "/data/steamvr/layers/$XR_LAYER.so" ro
+		cat >"$RUNDIR/$XR_LAYER.json" <<EOF
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_WGAPPS_gles_formats",
+        "library_path": "/data/steamvr/layers/$XR_LAYER.so",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "OpenGL ES swapchain formats SteamVR lacks or cannot create",
+        "disable_environment": "WGAPPS_XR_NO_GLES_LAYER"
+    }
+}
+EOF
+		bind "$RUNDIR/$XR_LAYER.json" \
+			"/vendor/etc/openxr/1/api_layers/implicit.d/${XR_LAYER#lib}.json" ro
+	fi
+
+	local rc out env
+	env="    setenv VR_PATHREG_OVERRIDE /vendor/etc/openvrpaths.vrpath
+    setenv VR_CONFIG_PATH /data/steamvr/config
+    setenv VR_LOG_PATH /data/steamvr/logs
+    setenv Steam3Master $NET_SUBNET.1:57343
+"
+	# SteamVR names the app to the host by Steam's ID for it.
+	if [[ -n "${SteamAppId:-}" ]]; then
+		env+="    setenv SteamAppId $SteamAppId
+"
+	fi
+	for rc in "$ROOTFS"/system/etc/init/hw/init.zygote*.rc; do
+		[[ -f "$rc" ]] || continue
+		out="$RUNDIR/${rc##*/}"
+		XR_ENV="$env" awk '{ print } /^service / { printf "%s", ENVIRON["XR_ENV"] }' "$rc" >"$out"
+		chmod 0644 "$out"
+		bind "$out" "/system/etc/init/hw/${rc##*/}" ro
+	done
+	return 0
+}
+
+# Android's graphics allocator crashes when two requests for buffers the CPU
+# can touch arrive together, and Android restarts its UI after it. Preload
+# our lock (gbm-lock/) into that service. Not without the library: a service
+# cannot start with a preload that is missing.
+GBM_LOCK=libwgapps_gbm_lock.so
+
+mount_gbm_lock() {
+	local rc=vendor/etc/init/android.hardware.graphics.allocator@4.0-service.minigbm_gbm_mesa.rc
+	local out="$RUNDIR/${rc##*/}"
+	[[ -f "$BASE/lib/$GBM_LOCK" && -f "$ROOTFS/$rc" ]] || return 0
+	mkdir -p "$RUNDIR"
+	awk -v lib="/vendor/lib64/$GBM_LOCK" \
+		'{ print } /^service / { print "    setenv LD_PRELOAD " lib }' "$ROOTFS/$rc" >"$out"
+	chmod 0644 "$out"
+	bind "$BASE/lib/$GBM_LOCK" "/vendor/lib64/$GBM_LOCK" ro
+	bind "$out" "/$rc" ro
+}
+
+# Per-app overrides: some apps choose their controllers or features by the
+# device model Android reports, and an unknown headset gets the bare minimum.
+# `wgapps app set` records what one app should see in $APPS_CONF (survives
+# updates), one "<package> <key>=<value>" per line. Android runs an app through
+# a preload named by the property `wrap.<package>` (this image is userdebug),
+# for that app only; ours (props-override/) answers its system-property reads
+# from /data/wgapps/props.d/<package>. The files are in a directory bound into
+# Android, so a change reaches the next process the app starts, no reboot.
+APP_PROPS=libwgapps_props.so
+APP_KEYS=(model manufacturer brand device)
+# Android keeps a copy of each ro.product.* property per partition and apps
+# differ in which they read (Wolvic: vendor; Java's Build.MODEL: none), so a key
+# sets them all. A property this Android does not have is skipped by the preload.
+APP_PARTITIONS=("" system. vendor. odm. system_ext. vendor_dlkm. product.)
+
+# Package names are at most 54 characters so a `wrap.` property value
+# ("LD_PRELOAD=/data/wgapps/props.so WGP=<package>") fits Android's 91.
+app_valid_package() {
+	local re='^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$'
+	[[ "$1" =~ $re && ${#1} -le 54 ]]
+}
+
+app_valid_key() {
+	local key
+	for key in "${APP_KEYS[@]}"; do
+		if [[ "$1" == "$key" ]]; then return 0; fi
+	done
+	return 1
+}
+
+# What the value may be: nothing the shell or a property file could take for
+# something else.
+app_valid_value() {
+	local re='^[A-Za-z0-9 ._+()/:-]{1,91}$'
+	[[ "$1" =~ $re && "$1" != " "* && "$1" != *" " ]]
+}
+
+# Drop the package's key (or all its lines when no key), then add key=value.
+app_conf_rewrite() { # package key value
+	local pkg="$1" key="$2" value="$3" tmp="$APPS_CONF.new" line
+	: >"$tmp"
+	if [[ -f "$APPS_CONF" ]]; then
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			if [[ -z "$key" && "$line" == "$pkg "* ]]; then continue; fi
+			if [[ -n "$key" && "$line" == "$pkg $key="* ]]; then continue; fi
+			printf '%s\n' "$line" >>"$tmp"
+		done <"$APPS_CONF"
+	fi
+	if [[ -n "$value" ]]; then
+		printf '%s %s=%s\n' "$pkg" "$key" "$value" >>"$tmp"
+	fi
+	mv "$tmp" "$APPS_CONF"
+}
+
+# $RUNDIR/props.d/<package>: "ro.product.<key>=<value>" per line, for every
+# valid line of $APPS_CONF. The directory is bind-mounted into Android, so it
+# is never replaced, only its files.
+generate_app_props() {
+	local dir="$RUNDIR/props.d" line pkg rest key value f partition
+	mkdir -p "$dir"
+	if [[ -f "$APPS_CONF" ]]; then
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			pkg="${line%% *}"
+			rest="${line#* }"
+			key="${rest%%=*}"
+			value="${rest#*=}"
+			if [[ "$line" != *" "* || "$rest" != *=* ]] || ! app_valid_package "$pkg" ||
+				! app_valid_key "$key" || ! app_valid_value "$value"; then
+				if [[ -n "$line" ]]; then log "ignoring invalid line in $APPS_CONF: $line"; fi
+				continue
+			fi
+			if [[ ! -e "$dir/.$pkg.new" ]]; then : >"$dir/.$pkg.new"; fi
+			for partition in "${APP_PARTITIONS[@]}"; do
+				printf 'ro.product.%s%s=%s\n' "$partition" "$key" "$value" >>"$dir/.$pkg.new"
+			done
+		done <"$APPS_CONF"
+	fi
+	for f in "$dir"/.*.new; do
+		[[ -e "$f" ]] || continue
+		chmod 0644 "$f"
+		pkg="${f##*/.}"
+		mv -f "$f" "$dir/${pkg%.new}"
+	done
+	for f in "$dir"/*; do
+		[[ -e "$f" ]] || continue
+		if ! app_conf_has "${f##*/}"; then rm -f "$f"; fi
+	done
+}
+
+app_conf_has() { # package
+	local line
+	[[ -f "$APPS_CONF" ]] || return 1
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		if [[ "$line" == "$1 "* ]]; then return 0; fi
+	done <"$APPS_CONF"
+	return 1
+}
+
+# The properties Android's init sets at boot: one `wrap.` per package with
+# overrides. Not without the library: an app cannot start with a preload that
+# is missing.
+app_wrap_props() {
+	local f
+	[[ -f "$BASE/lib/$APP_PROPS" ]] || return 0
+	for f in "$RUNDIR/props.d"/*; do
+		[[ -f "$f" ]] || continue
+		echo "wrap.${f##*/}=LD_PRELOAD=/data/wgapps/props.so WGP=${f##*/}"
+	done
+}
+
+mount_app_props() {
+	[[ -f "$BASE/lib/$APP_PROPS" ]] || return 0
+	mkdir -p "$RUNDIR/props.d"
+	bind "$BASE/lib/$APP_PROPS" /data/wgapps/props.so ro
+	bind "$RUNDIR/props.d" /data/wgapps/props.d ro
+}
+
+# Set the wrap property in the running Android, when it was started with the
+# library (otherwise the app would be told to load a file that is not there).
+app_apply_live() { # package
+	local pkg="$1" value=""
+	if ! running; then
+		log "saved; applies the next time Android starts"
+		return 0
+	fi
+	if ! asys '[ -f /data/wgapps/props.so ]' 2>/dev/null; then
+		log "saved; restart Android to enable per-app overrides"
+		return 0
+	fi
+	if [[ -f "$RUNDIR/props.d/$pkg" ]]; then
+		value="LD_PRELOAD=/data/wgapps/props.so WGP=$pkg"
+	fi
+	asys "setprop wrap.$pkg '$value'"
+	log "applies the next time $pkg starts (stop it now with: wgapps sh am force-stop $pkg)"
+}
+
+# The device-profile screen in Android's Settings (settings-app/) reads and
+# writes this file in the folder shared with Android; wgapps-profiles notices a
+# change and runs `app import` on it. The host mirrors $APPS_CONF to it after
+# every change of its own so the screen shows the truth.
+PROFILES_FILE="$SHARE/device-profiles.conf"
+APPS_ARCHIVE=WgappsSettings.apk
+
+export_profiles() {
+	local tmp="$SHARE/.device-profiles.conf.new"
+	mkdir -p "$SHARE"
+	if [[ -f "$APPS_CONF" ]]; then cp "$APPS_CONF" "$tmp"; else : >"$tmp"; fi
+	chmod 0644 "$tmp"
+	mv -f "$tmp" "$PROFILES_FILE"
+}
+
+# The valid lines of a file, one per package and key (the last wins), on stdout.
+app_valid_lines() { # file
+	local line pkg rest key value
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		pkg="${line%% *}"
+		rest="${line#* }"
+		key="${rest%%=*}"
+		value="${rest#*=}"
+		if [[ "$line" == *" "* && "$rest" == *=* ]] && app_valid_package "$pkg" &&
+			app_valid_key "$key" && app_valid_value "$value"; then
+			printf '%s\n' "$line"
+		fi
+	done <"$1" | awk '{
+		rest = substr($0, length($1) + 2)
+		k = $1 " " substr(rest, 1, index(rest, "=") - 1)
+		seen[k] = NR; text[NR] = $0; kk[NR] = k
+	} END { for (i = 1; i <= NR; i++) if (seen[kk[i]] == i) print text[i] }'
+}
+
+# The lines of a file that belong to a package (exact match: "." is not a wildcard).
+app_lines_of() { # file package
+	local line
+	[[ -f "$1" ]] || return 0
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		if [[ "$line" == "$2 "* ]]; then printf '%s\n' "$line"; fi
+	done <"$1"
+}
+
+app_import() { # file
+	local file="$1" tmp="$APPS_CONF.new" size pkg old new
+	[[ -f "$file" ]] || die "no such file: $file"
+	size="$(wc -c <"$file")"
+	((size <= 65536)) || die "$file is too big to be a list of overrides"
+	if [[ "$(tr -d '\0' <"$file" | wc -c)" != "$size" ]]; then
+		die "$file is not text"
+	fi
+	app_valid_lines "$file" >"$tmp"
+	old="$(cut -d' ' -f1 "$APPS_CONF" 2>/dev/null | sort -u || true)"
+	new="$(cut -d' ' -f1 "$tmp" | sort -u)"
+	local changed=()
+	for pkg in $(printf '%s\n%s\n' "$old" "$new" | sort -u); do
+		if [[ "$(app_lines_of "$APPS_CONF" "$pkg")" != "$(app_lines_of "$tmp" "$pkg")" ]]; then
+			changed+=("$pkg")
+		fi
+	done
+	mv "$tmp" "$APPS_CONF"
+	generate_app_props
+	export_profiles
+	for pkg in ${changed[@]+"${changed[@]}"}; do app_apply_live "$pkg"; done
+	log "imported ${#changed[@]} changed package(s) from $file"
+}
+
+# Android's Settings lists extra screens only from system apps, so ours is
+# mounted into /system/priv-app (settings-app/, built by
+# tools/build-settings-app.sh). Not without the file.
+mount_settings_app() {
+	[[ -f "$BASE/lib/$APPS_ARCHIVE" ]] || return 0
+	bind "$BASE/lib/$APPS_ARCHIVE" "/system/priv-app/${APPS_ARCHIVE%.apk}/$APPS_ARCHIVE" ro
+}
+
+cmd_app() {
+	local action="${1:-}" pkg key value
+	shift || true
+	case "$action" in
+	set)
+		[[ $# -eq 3 ]] || die "usage: wgapps app set <package> <key> <value>"
+		pkg="$1" key="$2" value="$3"
+		app_valid_package "$pkg" || die "not a package name of at most 54 characters: $pkg"
+		app_valid_key "$key" || die "unknown key '$key' (keys: ${APP_KEYS[*]})"
+		app_valid_value "$value" ||
+			die "value must be 1-91 characters of letters, digits, spaces and . _ + ( ) / : - (no leading or trailing space)"
+		app_conf_rewrite "$pkg" "$key" "$value"
+		generate_app_props
+		export_profiles
+		app_apply_live "$pkg"
+		;;
+	unset)
+		[[ $# -ge 1 && $# -le 2 ]] || die "usage: wgapps app unset <package> [key]"
+		pkg="$1" key="${2:-}"
+		app_valid_package "$pkg" || die "not a package name of at most 54 characters: $pkg"
+		if [[ -n "$key" ]]; then
+			app_valid_key "$key" || die "unknown key '$key' (keys: ${APP_KEYS[*]})"
+		fi
+		app_conf_rewrite "$pkg" "$key" ""
+		generate_app_props
+		export_profiles
+		app_apply_live "$pkg"
+		;;
+	import)
+		[[ $# -eq 1 ]] || die "usage: wgapps app import <file>"
+		app_import "$1"
+		;;
+	list)
+		if [[ -s "$APPS_CONF" ]]; then
+			cat "$APPS_CONF"
+		else
+			echo "no per-app overrides (wgapps app set <package> <key> <value>)"
+		fi
+		;;
+	*) die "usage: wgapps app set|unset|list ..." ;;
+	esac
+}
+
+# --- GLES implementation -----------------------------------------------------
+# `mesa` (default): Mesa's own EGL/GLES on Turnip's Vulkan; `angle`: ANGLE (GLES on top of the
+# same Vulkan driver). Anything but the word "angle" in $BASE/gpu-egl means mesa. Applies at start.
+gpu_egl() {
+	local mode=""
+	[[ -f "$BASE/gpu-egl" ]] && read -r mode <"$BASE/gpu-egl" || true
+	if [[ "$mode" == "angle" ]]; then echo angle; else echo mesa; fi
+}
+
+cmd_gpu() {
+	local what="${1:-}" mode="${2:-}"
+	[[ "$what" == "egl" ]] || die "usage: wgapps gpu egl [mesa|angle]"
+	if [[ $# -eq 1 ]]; then
+		gpu_egl
+		return 0
+	fi
+	[[ $# -eq 2 && ("$mode" == "mesa" || "$mode" == "angle") ]] || die "usage: wgapps gpu egl [mesa|angle]"
+	mkdir -p "$BASE"
+	if [[ "$mode" == "mesa" ]]; then rm -f "$BASE/gpu-egl"; else echo "$mode" >"$BASE/gpu-egl"; fi
+	if running; then log "$mode saved; restart Android for it to apply"; else log "$mode saved"; fi
+}
+
+# --- window mode -----------------------------------------------------------
+# `floating`: apps open as movable windows inside Android's one panel (Android's own
+# multi-window mode); `single` (default): each app fills the panel. $BASE/windows is
+# not touched by update/rollback, and anything but the word "floating" means single.
+windows_mode() {
+	local mode=""
+	[[ -f "$BASE/windows" ]] && read -r mode <"$BASE/windows" || true
+	if [[ "$mode" == "floating" ]]; then echo floating; else echo single; fi
+}
+
+cmd_windows() {
+	local mode="${1:-}"
+	if [[ $# -eq 0 ]]; then
+		windows_mode
+		return 0
+	fi
+	[[ $# -eq 1 && ("$mode" == "floating" || "$mode" == "single") ]] ||
+		die "usage: wgapps windows floating|single"
+	mkdir -p "$BASE"
+	echo "$mode" >"$BASE/windows"
+	if running; then
+		log "$mode saved; restart Android for it to apply"
+	else
+		log "$mode saved"
+	fi
+}
+
+# --- app catalog ---------------------------------------------------------
+# What the user can open, one line per app: package<TAB>label<TAB>activity<TAB>kind.
+# Android's command line gives components but no label text, so labels come from
+# $SHARE/app-labels.conf (package<TAB>label, written by the Settings app) and fall
+# back to the capitalised last part of the package. kind is xr when the launcher
+# component itself declares org.khronos.openxr.intent.category.IMMERSIVE_HMD
+# (Chrome lists a WebXR host activity there that is not its launcher entry).
+APPS_LABELS="$SHARE/app-labels.conf"
+APPS_HIDDEN="$BASE/apps-hidden"
+APPS_KIND="$BASE/apps-kind"
+APPS_HIDDEN_DEFAULT="com.android.launcher3 com.android.documentsui com.google.android.googlequicksearchbox dev.wgapps.settings"
+
+catalog_build() {
+	local launcher="$1" xr="$2" labels hidden kinds
+	labels="$APPS_LABELS"
+	hidden="$APPS_HIDDEN"
+	kinds="$APPS_KIND"
+	[[ -f "$labels" ]] || labels=/dev/null
+	[[ -f "$hidden" ]] || hidden=/dev/null
+	[[ -f "$kinds" ]] || kinds=/dev/null
+	LC_ALL=C awk -v hidden_default="$APPS_HIDDEN_DEFAULT" '
+		function clean(s) { gsub(/\r/, "", s); gsub(/[\001-\037\177]/, "", s); return s }
+		BEGIN {
+			n = split(hidden_default, parts, " ")
+			for (i = 1; i <= n; i++) skip[parts[i]] = 1
+		}
+		file == 1 { # labels
+			line = $0; gsub(/\r/, "", line)
+			tab = index(line, "\t")
+			if (tab < 2) next
+			pkg = substr(line, 1, tab - 1); text = substr(line, tab + 1)
+			gsub(/\t/, " ", text); text = clean(text)
+			if (text != "") label[pkg] = text
+			next
+		}
+		file == 2 { # hidden
+			line = clean($0); sub(/^ +/, "", line); sub(/ +$/, "", line)
+			if (line != "" && substr(line, 1, 1) != "#") skip[line] = 1
+			next
+		}
+		file == 3 { # xr components
+			line = clean($0); sub(/^ +/, "", line); sub(/ +$/, "", line)
+			if (line ~ /^[^ \/]+\/[^ ]+$/) xr[line] = 1
+			next
+		}
+		file == 4 { # kind chosen by the user: "<package> xr|2d"
+			if (NF == 2 && ($2 == "xr" || $2 == "2d")) forced[$1] = $2
+			next
+		}
+		{ # launcher components
+			line = clean($0); sub(/^ +/, "", line); sub(/ +$/, "", line)
+			if (line !~ /^[^ \/]+\/[^ ]+$/) next
+			slash = index(line, "/")
+			pkg = substr(line, 1, slash - 1); activity = substr(line, slash + 1)
+			if (pkg !~ /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/ || length(pkg) > 54) next
+			if (activity !~ /^[A-Za-z0-9_.$]+$/) next
+			if ((pkg in seen) || (pkg in skip)) next
+			seen[pkg] = 1
+			name = (pkg in label) ? label[pkg] : ""
+			if (name == "") {
+				m = split(pkg, bits, ".")
+				name = toupper(substr(bits[m], 1, 1)) substr(bits[m], 2)
+			}
+			kind = (line in xr) ? "xr" : "2d"
+			if (pkg in forced) kind = forced[pkg]
+			printf "%s\t%s\t%s\t%s\n", pkg, name, line, kind
+		}
+	' file=1 "$labels" file=2 "$hidden" file=3 "$xr" file=4 "$kinds" file=5 "$launcher" | LC_ALL=C sort -t "$(printf '\t')" -k2,2f -k1,1
+}
+
+# Ask the Settings app to rewrite app-labels.conf (it can read the apps' names; the
+# command line cannot) and wait for the new file, 0.1 s at a time. If it does not
+# answer, the previous file stays. Not without the app.
+catalog_refresh_labels() {
+	[[ -f "$BASE/lib/$APPS_ARCHIVE" ]] || return 0
+	local old="$APPS_LABELS.prev" tries
+	if [[ -f "$APPS_LABELS" ]]; then mv -f "$APPS_LABELS" "$old"; fi
+	asys "am broadcast -n dev.wgapps.settings/.LabelsReceiver" >/dev/null 2>&1 || true
+	for ((tries = 0; tries < ${WGAPPS_LABEL_TRIES:-50}; tries++)); do
+		[[ -f "$APPS_LABELS" ]] && break
+		sleep 0.1
+	done
+	if [[ -f "$APPS_LABELS" ]]; then
+		rm -f "$old"
+	elif [[ -f "$old" ]]; then
+		mv -f "$old" "$APPS_LABELS"
+	fi
+}
+
+apps_kind_set() { # package kind
+	local tmp="$APPS_KIND.new" line
+	: >"$tmp"
+	if [[ -f "$APPS_KIND" ]]; then
+		while IFS= read -r line || [[ -n "$line" ]]; do
+			[[ "$line" == "$1 "* ]] || printf '%s\n' "$line" >>"$tmp"
+		done <"$APPS_KIND"
+	fi
+	if [[ "$2" != auto ]]; then printf '%s %s\n' "$1" "$2" >>"$tmp"; fi
+	mv "$tmp" "$APPS_KIND"
+}
+
+cmd_apps() {
+	local action="${1:-}" launcher xr catalog status
+	shift || true
+	case "$action" in
+	list)
+		running || die "Android is not running (wgapps start)"
+		catalog_refresh_labels
+		launcher="$(mktemp)" xr="$(mktemp)"
+		asys "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER" |
+			tr -d '\r' >"$launcher" || true
+		asys "cmd package query-activities --brief -a android.intent.action.MAIN -c org.khronos.openxr.intent.category.IMMERSIVE_HMD" |
+			tr -d '\r' >"$xr" || true
+		catalog_build "$launcher" "$xr"
+		rm -f "$launcher" "$xr"
+		;;
+	sync)
+		# One Steam library entry per Android app (see steam-shortcuts.py sync).
+		catalog="$(mktemp)"
+		cmd_apps list >"$catalog" || {
+			rm -f "$catalog"
+			return 1
+		}
+		cut -f1,2 "$catalog" >"$catalog.tsv"
+		python3 "$BIN/steam-shortcuts.py" sync "$catalog.tsv" || status=$?
+		rm -f "$catalog" "$catalog.tsv"
+		return "${status:-0}"
+		;;
+	kind)
+		# How the app is treated: xr (an OpenXR app), 2d (a flat app) or auto (detected).
+		[[ $# -eq 2 ]] || die "usage: wgapps apps kind <package> xr|2d|auto"
+		app_valid_package "$1" || die "not a package name of at most 54 characters: $1"
+		[[ "$2" == xr || "$2" == 2d || "$2" == auto ]] || die "kind must be xr, 2d or auto"
+		apps_kind_set "$1" "$2"
+		;;
+	*) die "usage: wgapps apps list|sync|kind" ;;
+	esac
+}
+
 cmd_start() {
 	local headless=false
 	[[ "${1:-}" == "--headless" ]] && headless=true
@@ -229,8 +848,13 @@ cmd_start() {
 	fi
 	podman rm -f "$NAME" >/dev/null 2>&1 || true
 	mkdir -p "$DATA" "$SHARE"
+	# Android's apps write here too (the device-profile screen); every user ID
+	# in the container is a sub-ID of ours.
+	chmod 0777 "$SHARE"
+	export_profiles
 	ensure_idmap
 	generate_overrides
+	generate_app_props
 	write_props "$headless"
 
 	local seccomp="$BASE/lepton.seccomp.json"
@@ -296,6 +920,10 @@ cmd_start() {
 			ARGS+=(--mount "type=bind,source=$BASE/$dir/$f,destination=/$f,ro")
 		done < <(cd "$BASE/$dir" && find . -type f -printf '%P\0')
 	done
+	mount_xr
+	mount_gbm_lock
+	mount_app_props
+	mount_settings_app
 	local dev
 	for dev in /dev/dri/card0 /dev/dri/renderD128 /dev/zero /dev/null /dev/full \
 		/dev/fuse /dev/tty /dev/shm /dev/snd /dev/uhid /dev/net/tun /dev/random \
@@ -347,6 +975,7 @@ start_helpers() {
 	start_helper wgapps-pad "/proc/$pid/root/dev/input/wl_keyboard_events"
 	start_helper wgapps-battery
 	start_helper wgapps-clipboard
+	WGAPPS_BASE="$BASE" WGAPPS_SHARE="$SHARE" WGAPPS_BIN="$BIN" start_helper wgapps-profiles
 }
 
 start_helper() {
@@ -359,7 +988,7 @@ start_helper() {
 
 stop_helpers() {
 	local name pid
-	for name in wgapps-pad wgapps-battery wgapps-clipboard; do
+	for name in wgapps-pad wgapps-battery wgapps-clipboard wgapps-profiles; do
 		pid="$(cat "$RUNDIR/$name.pid" 2>/dev/null || true)"
 		if [[ -n "$pid" ]] && grep -q "$name" "/proc/$pid/cmdline" 2>/dev/null; then
 			kill "$pid" 2>/dev/null || true
@@ -443,30 +1072,48 @@ cmd_run() {
 # Steam launches shortcuts under `reaper SteamLaunch AppId=<id>`, and
 # gamescope maps a Wayland client to a Steam app by walking the client's
 # process ancestry to that reaper. conmon detaches and is re-parented to the
-# reaper (a child subreaper), so Android must be (re)started from here for
-# the window to get focus, the overlay and Quit. Quitting from Steam
-# terminates this script; stop Android cleanly on the way out.
+# reaper (a child subreaper), so the entry that STARTS Android owns the panel
+# (focus, overlay, Quit) and has to be the one that starts it.
+#
+# Every later entry attaches: it runs its app in the container that is
+# already up (`am start`), never restarts or stops it, and ends when its app
+# has no process left (wgapps-appwatch), so Steam's "running" follows the app.
+# Quitting an attached entry from Steam force-stops only its app. Quitting
+# the owner stops Android, as it always did (the other apps go with it).
 cmd_steam() {
-	local pkg="${1:-}" act
+	local pkg="${1:-}" act owner=false
+	[[ -z "$pkg" ]] || app_valid_package "$pkg" || die "not a package name: $pkg"
 	if running; then
-		log "restarting Android under the Steam launch"
-		cmd_stop
+		log "attaching to the running Android"
+	else
+		owner=true
+		trap 'cmd_stop; exit 0' TERM INT HUP
+		cmd_start
+		cmd_wait_boot 240
 	fi
-	trap 'cmd_stop; exit 0' TERM INT HUP
-	cmd_start
-	cmd_wait_boot 240
 	if [[ -n "$pkg" ]]; then
 		act="$(launcher_activity "$pkg")"
 		if [[ "$act" == */* ]]; then
 			asys "am start -n '$act'" >/dev/null
 		else
 			log "no launcher activity for $pkg; showing the home screen"
+			pkg=""
 		fi
 	fi
-	podman wait "$NAME" >/dev/null 2>&1 &
+	if [[ -z "$pkg" ]]; then
+		[[ "$owner" == true ]] || asys "am start -a android.intent.action.MAIN -c android.intent.category.HOME" >/dev/null
+	fi
+	if [[ "$owner" == true || -z "$pkg" ]]; then
+		# The owner (and an entry with no app of its own) lives as long as Android.
+		podman wait "$NAME" >/dev/null 2>&1 &
+	else
+		WGAPPS_CONTAINER="$NAME" python3 "$BIN/wgapps-appwatch" "$pkg" &
+		# shellcheck disable=SC2064 # $pkg and the watcher's pid are fixed from here on
+		trap "kill $! 2>/dev/null; asys \"am force-stop '$pkg'\" >/dev/null 2>&1 || true; exit 0" TERM INT HUP
+	fi
 	wait $! || true
 	trap - TERM INT HUP
-	log "Android exited"
+	log "${pkg:-Android} exited"
 }
 
 # --- install, update, uninstall -------------------------------------------
@@ -636,6 +1283,52 @@ cmd_uninstall() {
 	log "removed $BASE"
 }
 
+cmd_report() {
+	local out="${1:-$HOME/wgapps-report-$(date +%Y%m%d-%H%M%S).txt}"
+	section() { printf '\n===== %s =====\n' "$1"; }
+	(
+		set +e +o pipefail
+		section "wgapps"
+		echo "version: $(cmd_version)"
+		echo "date: $(date '+%F %T %z')"
+		echo "BASE: $BASE"
+		for f in windows gpu-egl apps-kind device.prop; do
+			[[ -e "$BASE/$f" ]] && printf '%s: %s\n' "$f" "$(tr '\n' ' ' <"$BASE/$f")"
+		done
+		section "host"
+		uname -a
+		grep -E '^(PRETTY_NAME|VARIANT_ID|BUILD_ID)=' /etc/os-release 2>/dev/null
+		podman --version 2>&1
+		df -h "$BASE" "$HOME" 2>&1
+		free -m 2>&1
+		section "steam"
+		echo "steam running: $(pgrep -x steam >/dev/null && echo yes || echo no)"
+		pgrep -ax gamescope 2>&1 | cut -c1-200
+		section "container"
+		podman ps -a --filter "name=$NAME" 2>&1
+		podman inspect "$NAME" --format 'state={{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' 2>&1
+		section "status"
+		cmd_status 2>&1
+		section "podman logs (last 200 lines)"
+		podman logs --tail 200 "$NAME" 2>&1
+		section "Android init (run/kmsg.log, last 300 lines)"
+		tail -n 300 "$RUNDIR/kmsg.log" 2>&1
+		section "waydroid.prop"
+		grep -vE 'gsf|android_id|serial|imei|mac' "$RUNDIR/waydroid.prop" 2>&1
+		section "image"
+		cat "$BASE/images/variant" 2>&1
+		ls -l "$BASE/images" 2>&1
+		if running; then
+			section "Android logcat (last 1500 lines)"
+			podman exec "$NAME" /system/bin/logcat -d -t 1500 2>&1
+			section "Android tombstones"
+			asys 'ls -l /data/tombstones 2>/dev/null | tail -n 10' 2>&1
+		fi
+	) >"$out" 2>&1
+	log "wrote $out ($(wc -c <"$out") bytes); read it before sharing"
+	echo "$out"
+}
+
 cmd_version() {
 	echo "$(cat "$BASE/VERSION" 2>/dev/null || echo dev) ($(cat "$BASE/images/variant" 2>/dev/null || echo "no Android images"))"
 }
@@ -666,6 +1359,11 @@ main() {
 	logcat) podman exec "$NAME" /system/bin/logcat "$@" ;;
 	launch) cmd_launch "$@" ;;
 	run) cmd_run "$@" ;;
+	app) cmd_app "$@" ;;
+	apps) cmd_apps "$@" ;;
+	windows) cmd_windows "$@" ;;
+	gpu) cmd_gpu "$@" ;;
+	report) cmd_report "$@" ;;
 	steam) cmd_steam "$@" ;;
 	help | -h | --help) usage ;;
 	*)
@@ -675,4 +1373,7 @@ main() {
 	esac
 }
 
-main "$@"
+# Sourced by tests/test_xr.py, which calls the functions directly.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi

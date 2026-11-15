@@ -40,6 +40,8 @@ REQUIRED_FILES = (
     "wgapps/bin/wgapps-pad",
     "wgapps/bin/wgapps-battery",
     "wgapps/bin/wgapps-clipboard",
+    "wgapps/bin/wgapps-profiles",
+    "wgapps/bin/wgapps-appwatch",
     "wgapps/bin/wgapps-ota",
     "wgapps/bin/wgapps-gen-overrides",
     "wgapps/bin/steam-shortcuts.py",
@@ -50,6 +52,9 @@ REQUIRED_FILES = (
     "wgapps/lib/libgbinder.so.1",
     "wgapps/lib/licenses/libgbinder.LICENSE",
     "wgapps/lib/licenses/libglibutil.LICENSE",
+    "wgapps/lib/libwgapps_xr_gles.so",
+    "wgapps/lib/libwgapps_gbm_lock.so",
+    "wgapps/lib/libwgapps_props.so",
 )
 # Android/Google artifacts and files generated from Waydroid's vendor image
 # must never ship.

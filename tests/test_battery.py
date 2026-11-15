@@ -73,6 +73,9 @@ class MappingTests(unittest.TestCase):
         values = bat.to_android(self.state(temp=305, counter=1500000))
         self.assertEqual((values["temp"], values["counter"]), (305, 1500000))
 
+    def test_negative_counter_is_not_passed(self):
+        self.assertNotIn("counter", bat.to_android(self.state(counter=-308000)))
+
     def test_no_battery_sets_nothing(self):
         self.assertEqual(
             bat.to_android({"battery": None, "ac": True, "usb": False, "wireless": False}), {}

@@ -1,0 +1,13 @@
+4 activities found:
+  Activity #0:
+    priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false
+    com.android.chrome/org.chromium.components.webxr.XrHostActivity
+  Activity #1:
+    priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false
+    com.igalia.wolvic.vanilla/com.igalia.wolvic.VRBrowserActivity
+  Activity #2:
+    priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false
+    org.khronos.openxr.hello_xr.opengles/android.app.NativeActivity
+  Activity #3:
+    priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false
+    org.khronos.openxr.hello_xr.vulkan/android.app.NativeActivity
