@@ -193,12 +193,19 @@ bind() {
 	ARGS+=(--mount "type=bind,source=$src,destination=$dst,$opt")
 }
 
-# Seccomp profile for Android in the container when Lepton's is not installed:
-# everything is allowed except what a container has no business doing (kernel
-# modules, kexec, changing the clock) and open_by_handle_at. Calls a rootless
-# container is not allowed to make but Android makes at boot (setpriority,
-# nice, the clock) are answered with success instead of EPERM; with EPERM init
-# cannot start zygote and Android never finishes booting.
+# Seccomp profile for Android in the container: everything is allowed except
+# what a container has no business doing (kernel modules, kexec, changing the
+# clock) and open_by_handle_at. Calls a rootless container is not allowed to
+# make but Android makes at boot (setpriority, nice, the clock) are answered
+# with success instead of EPERM; with EPERM init cannot start zygote and
+# Android never finishes booting.
+#
+# Always ours, never Valve's Lepton profile: since 2026-10-09 Lepton's also
+# answers setuid, setgid, setgroups and chown with fake success (its Android
+# runs without separate uids). Here init then believes it became the service's
+# user while still root, and the exec of a 0550 binary owned by that user fails
+# ("cannot execv('/system/bin/logd') ... Permission denied"): logd, then
+# everything after it, never starts. docs/bugs/2026-11-15-lepton-seccomp-boot.md
 write_seccomp() {
 	local out="$RUNDIR/android.seccomp.json"
 	cat >"$out" <<'JSON'
@@ -233,7 +240,6 @@ cmd_start() {
 	generate_overrides
 	write_props "$headless"
 
-	local seccomp="$BASE/lepton.seccomp.json"
 	# Hostname and hosts file as on stock Android: podman's generated
 	# /etc/hosts would hide /system/etc/hosts and map the hostname to the
 	# pasta address, so apps that bind "this device" (Plex's offline
@@ -263,11 +269,10 @@ cmd_start() {
 		ipc_lock sys_chroot; do
 		ARGS+=(--cap-add "$cap")
 	done
-	# Without Lepton's profile podman's default one applies, and it refuses
-	# setpriority/nice: init cannot start zygote and Android never finishes
-	# booting. Use our own profile instead.
-	[[ -f "$seccomp" ]] || seccomp="$(write_seccomp)"
-	ARGS+=(--security-opt "seccomp=$seccomp")
+	# Our own profile, whatever Lepton ships (see write_seccomp). A copy of
+	# Lepton's from an earlier install is not used and is removed.
+	rm -f "$BASE/lepton.seccomp.json"
+	ARGS+=(--security-opt "seccomp=$(write_seccomp)")
 	# shellcheck disable=SC2054 # commas are mount options, not separators
 	ARGS+=(
 		--tmpfs /dev:rw,nosuid,U
@@ -456,8 +461,6 @@ cmd_steam() {
 
 # --- install, update, uninstall -------------------------------------------
 
-LEPTON_SECCOMP="$HOME/.local/share/Steam/steamapps/common/Lepton/liblepton/lepton.seccomp.json"
-
 check_prereqs() {
 	local bad=0 tool free
 	[[ "$(uname -m)" == "aarch64" ]] || {
@@ -505,15 +508,8 @@ cmd_install() {
 	mkdir -p "$BASE/images" "$RUNDIR"
 	echo "$flavor" >"$BASE/flavor"
 	export WGAPPS_FLAVOR="$flavor"
-	if [[ -f "$LEPTON_SECCOMP" ]]; then
-		# Valve's profile for Android in rootless podman on this kernel; used
-		# when Lepton is installed, otherwise podman's default profile.
-		cp "$LEPTON_SECCOMP" "$BASE/lepton.seccomp.json"
-		log "Lepton found: using Valve's seccomp profile for Android"
-	else
-		rm -f "$BASE/lepton.seccomp.json"
-		log "Lepton not installed: using wgapps' own seccomp profile (both boot Android)"
-	fi
+	rm -f "$BASE/lepton.seccomp.json"
+	log "seccomp: using wgapps' own profile (Lepton's, if installed, is not used)"
 	if [[ "$flavor" == "VANILLA" ]]; then
 		log "downloading Waydroid's images without Google apps from Waydroid (about 1 GB)"
 	else

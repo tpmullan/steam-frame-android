@@ -11,7 +11,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DIR="${WGAPPS_BASE:-$HOME/.local/share/waydroid-gapps}/images"
 VARIANT="${WGAPPS_VARIANT:-waydroid_arm64_only}"
 # GAPPS (with Google apps) or VANILLA (without); install records the choice.
-FLAVOR="${WGAPPS_FLAVOR:-$(cat "$DIR/../flavor" 2>/dev/null || echo GAPPS)}"
+FLAVOR="${WGAPPS_FLAVOR:-$(cat "${DIR%/*}/flavor" 2>/dev/null || echo GAPPS)}"
 # GAPPS keeps the marker it always had, so existing installs do not re-download.
 KEY="$VARIANT"
 [[ "$FLAVOR" == "GAPPS" ]] || KEY="$VARIANT $FLAVOR"
