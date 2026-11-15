@@ -10,6 +10,18 @@ set -euo pipefail
 export LD_PRELOAD=
 unset LD_LIBRARY_PATH
 
+# Always talk to the user's own session, whichever shell this runs in. A
+# terminal inside a nested desktop session has another XDG_RUNTIME_DIR
+# (e.g. /run/user/1000/nested_plasma); podman then looks for the container's
+# state there ("container ... does not exist", "sd-bus ... Input/output
+# error", and `status` saying "stopped" for a running Android).
+# docs/bugs/2026-11-15-wrong-session-podman.md
+XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XDG_RUNTIME_DIR
+if [[ -S "$XDG_RUNTIME_DIR/bus" ]]; then
+	export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
 BASE="${WGAPPS_BASE:-$HOME/.local/share/waydroid-gapps}"
 ROOTFS="$BASE/rootfs"
 DATA="$BASE/data"

@@ -305,6 +305,9 @@ def check_image(source: str, patterns: re.Pattern[bytes]) -> str:
         extra = ()
         if source.startswith("oci-archive:"):
             layout.mkdir()
+            if not hasattr(tarfile, "data_filter"):
+                # Without the "data" filter an archive can write outside the folder.
+                raise ReleaseError("checking an oci-archive needs Python 3.12 or newer")
             with tarfile.open(source.removeprefix("oci-archive:")) as tar:
                 tar.extractall(layout, filter="data")
         elif source.startswith("docker://"):

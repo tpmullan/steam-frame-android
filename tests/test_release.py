@@ -289,6 +289,9 @@ class RegistryManifestTests(unittest.TestCase):
             rel.check_registry_manifest('{"mediaType": "application/vnd.oci.image.index.v1+json"}')
 
 
+@unittest.skipUnless(
+    hasattr(tarfile, "data_filter"), "the image check needs Python 3.12+ (tarfile filters)"
+)
 class CheckImageArchiveTests(unittest.TestCase):
     def test_oci_archive_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -299,6 +302,20 @@ class CheckImageArchiveTests(unittest.TestCase):
                     tar.add(item, arcname=item.name)
             summary = rel.check_image(f"oci-archive:{archive}", rel.internal_patterns({}))
             self.assertIn("linux/arm64", summary)
+
+
+class OldPythonTests(unittest.TestCase):
+    def test_an_old_python_is_refused_clearly_not_with_a_typeerror(self):
+        real = getattr(tarfile, "data_filter", None)
+        if real is not None:
+            del tarfile.data_filter
+        try:
+            with self.assertRaises(rel.ReleaseError) as ctx:
+                rel.check_image("oci-archive:/nonexistent.tar", rel.internal_patterns({}))
+        finally:
+            if real is not None:
+                tarfile.data_filter = real
+        self.assertIn("Python 3.12", str(ctx.exception))
 
 
 if __name__ == "__main__":

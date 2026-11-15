@@ -97,7 +97,9 @@ from Waydroid under their own terms and are not part of this project.
   virtual Xbox pad; `bin/wgapps-ota` resolves Waydroid builds;
   `bin/wgapps-gen-overrides` derives the two vendor fixes from the
   installed image; `overrides/` holds our own init and network files.
-- Tests: `cd tests && python3 -m unittest -v` (needs git). Lint: shellcheck,
+- Tests: `python3 -m unittest discover -s tests -v` (needs git and **Python 3.12 or
+  newer**: with an older `python3`, such as macOS's `/usr/bin/python3`, the tests
+  stop with a message saying so). Lint: shellcheck,
   shfmt, ruff. CI runs on GitLab (`.gitlab-ci.yml`).
 - `tools/deploy.sh` copies a checkout to a Frame over SSH in the release
   layout.

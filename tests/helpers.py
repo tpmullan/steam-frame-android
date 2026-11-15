@@ -3,6 +3,12 @@
 import importlib.machinery
 import importlib.util
 import pathlib
+import sys
+
+# CI runs Python 3.12. An older python3 (macOS ships 3.9 as /usr/bin/python3) fails with dozens of
+# confusing errors, so say what is wrong once.
+if sys.version_info < (3, 12):
+    raise ImportError(f"these tests need Python 3.12 or newer; this is {sys.version.split()[0]}")
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
 
