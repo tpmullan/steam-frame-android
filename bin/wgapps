@@ -189,6 +189,19 @@ migrate_data_ids() {
 	done < <(find "$data" -xdev -gid +49999 -gid -60000 -print0)
 }
 
+# keystore2 runs as uid 1017 and aborts at boot ("Failed to attach database
+# persistent", open() -> EACCES) when /data/misc/keystore holds files owned by
+# root. A boot under Lepton's 2026-10-09 seccomp profile, which fakes setuid and
+# chown, leaves them that way, so a Frame that booted once under it loops forever
+# even after the profile is fixed. docs/bugs/2026-11-15-keystore-owner.md
+# Runs inside `podman unshare`, where container ID N is ID N.
+AID_KEYSTORE=1017
+repair_keystore_owner() {
+	local dir="$1"
+	[[ -d "$dir" ]] || return 0
+	find "$dir" -xdev ! -uid "$AID_KEYSTORE" -exec chown -h "$AID_KEYSTORE:$AID_KEYSTORE" {} +
+}
+
 ensure_idmap() {
 	local marker="$BASE/.idmap-version"
 	[[ "$(cat "$marker" 2>/dev/null)" == "$IDMAP_VERSION" ]] && return 0
@@ -249,6 +262,7 @@ cmd_start() {
 	podman rm -f "$NAME" >/dev/null 2>&1 || true
 	mkdir -p "$DATA" "$SHARE"
 	ensure_idmap
+	podman unshare "$0" _repair-keystore "$DATA/misc/keystore"
 	generate_overrides
 	write_props "$headless"
 
@@ -645,6 +659,7 @@ main() {
 	gsf-id) cmd_gsf_id ;;
 	prepare) cmd_prepare "$@" ;;
 	_migrate-ids) migrate_data_ids "$@" ;;
+	_repair-keystore) repair_keystore_owner "$@" ;;
 	start) cmd_start "$@" ;;
 	stop) cmd_stop ;;
 	status) cmd_status ;;
