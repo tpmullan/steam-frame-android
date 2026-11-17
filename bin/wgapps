@@ -1195,6 +1195,21 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Back out what the ACL method did to the folders, which breaks an idmapped mount: Android's user may create
+# files in a folder only when the folder's group maps through the mount (your own group does), and a named
+# ACL entry for the media_rw group, or the folder owned by that group, makes creating files fail. Found on a
+# Frame; the folder wgapps made goes back to your group, and a folder you added loses only our entries.
+idmap_prepare_folders() {
+	local name path mode
+	while IFS=$'\t' read -r name path mode; do
+		share_unprepare "$path"
+		if [[ "$name" == "$SHARE_DEFAULT_NAME" ]]; then
+			chgrp "$(id -g)" "$path" 2>/dev/null || true
+			chmod g-s "$path" 2>/dev/null || true
+		fi
+	done < <(shares_list)
+}
+
 share_idmap_setup() {
 	local ids uid gid name path mode unit
 	running || die "start Android first: the IDs its storage layer uses are read from it"
@@ -1202,6 +1217,7 @@ share_idmap_setup() {
 	read -r uid gid <<<"$ids"
 	[[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || die "could not map Android's storage user to a host ID ($ids)"
 	while IFS=$'\t' read -r name path mode; do mkdir -p "$IDMAP_DIR/$name"; done < <(shares_list)
+	idmap_prepare_folders
 	unit="$(mktemp)"
 	idmap_unit "$uid" "$gid" >"$unit"
 	log "Android's storage user is $uid:$gid on this host; your files will show as that user inside Android"

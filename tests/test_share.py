@@ -274,6 +274,31 @@ class IdmapShareTests(unittest.TestCase):
         self.mount("Host")
         self.assertEqual(share.rw_shares(self.base, self.home, str(self.mountinfo)), [])
 
+    def test_setup_backs_out_the_acl_method_so_android_can_create_files(self):
+        # On a Frame a folder owned by the media_rw group, or with a named ACL entry for it, let
+        # Android read but not create files through the idmapped mount; the built-in folder goes
+        # back to the user's group.
+        tools = self.home / "tools"
+        tools.mkdir()
+        log = self.home / "calls.log"
+        for tool in ("podman", "setfacl", "chgrp", "chmod"):
+            (tools / tool).write_text(f'#!/bin/sh\necho "{tool} $*" >>{log}\n')
+            (tools / tool).chmod(0o755)
+        env = {**self.env, "PATH": f"{tools}:/usr/bin:/bin"}
+        work = self.home / "Work"
+        work.mkdir()
+        wgapps_call(env, "cmd_share", "add", str(work), "Work", "--rw")
+        log.write_text("")
+        done = wgapps_call(env, "idmap_prepare_folders")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        text = log.read_text()
+        self.assertIn(f"chgrp {__import__('os').getgid()} {self.home / 'Android-share'}", text)
+        self.assertIn(f"chmod g-s {self.home / 'Android-share'}", text)
+        self.assertIn("setfacl -x g:", text)
+        self.assertIn(f"{work}", text)
+        # a folder the user added keeps its owner, group and mode
+        self.assertNotIn(f"chgrp {__import__('os').getgid()} {work}", text)
+
     def test_setup_needs_android_running_and_status_says_what_each_share_uses(self):
         done = self.call("cmd_share", "idmap-setup")
         self.assertNotEqual(done.returncode, 0)

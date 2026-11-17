@@ -217,10 +217,13 @@ What Android can see and do:
   reverse. Files then stay owned by you on disk, whoever made them, and the ACLs and the `wgapps-share` helper
   are no longer used for those folders. `wgapps share idmap-status` shows which method each folder uses,
   `idmap-remove` undoes it, and after `wgapps share add` run `idmap-setup` again to include the new folder.
-  Checked on a real Linux 7.0 kernel with this helper and real rootless podman: a file you own shows inside the
-  container as owned by Android's storage user, and what that user writes lands on disk owned by you. Not yet
-  run on a Frame (the systemd unit and Android's own storage layer on top of the mount), so treat it as
-  experimental (needs Linux 5.12 or newer and ext4, xfs or btrfs under the folder).
+  Checked on a real Linux 7.0 kernel with this helper and real rootless podman, and on a Frame with Android's own
+  ID mapping: Android's storage user creates, edits and deletes files and folders in the folder, you read, edit
+  and delete them, and everything stays owned by you on disk. Android can create files only in folders whose
+  group is your own group (setup puts `~/Android-share` back to it); on a folder you added with another group
+  it can read but not create. The boot unit itself ran on a Frame; the restart of Android with the mount in
+  place was not tried, so treat it as experimental (needs Linux 5.12 or newer and ext4, xfs or btrfs under the
+  folder).
 - `/`, wgapps' own data and names Android's storage already uses (Download, DCIM, Music and so on) cannot
   be shared.
 
