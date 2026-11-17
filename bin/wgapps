@@ -1826,6 +1826,8 @@ cmd_steam() {
 
 # --- install, update, uninstall -------------------------------------------
 
+LEPTON_SECCOMP="$HOME/.local/share/Steam/steamapps/common/Lepton/liblepton/lepton.seccomp.json"
+
 check_prereqs() {
 	local bad=0 tool free
 	[[ "$(uname -m)" == "aarch64" ]] || {
