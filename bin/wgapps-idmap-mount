@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Make an idmapped bind mount of a folder (run as root, by wgapps-idmap.service).
+
+The folder keeps its owner on disk (you). Through the new mount a file owned by FS_UID shows up
+as owned by MNT_UID, and what a process with MNT_UID creates or changes is stored as FS_UID,
+likewise for groups. A rootless container that bind-mounts the new directory then sees you as
+Android's storage user, so Android and you read and write the same files with no chown and no
+ACLs. Checked on a Linux 7.0 kernel: a user namespace mapping `FS_ID MNT_ID 1` makes the mount
+show FS_ID's files as MNT_ID's; ids it does not map show as 65534 and cannot be used.
+
+Needs a kernel and file system with idmapped mount support (Linux 5.12+; ext4, xfs, btrfs, tmpfs).
+
+Usage: wgapps-idmap-mount SOURCE TARGET FS_UID MNT_UID FS_GID MNT_GID
+       wgapps-idmap-mount --unmount TARGET
+Installed as /etc/wgapps/wgapps-idmap-mount, owned by root (it runs as root, so it must not be
+a file you can edit).
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import struct
+import subprocess
+import sys
+import time
+
+# The same numbers on arm64 and x86-64 (the generic syscall table since Linux 5.2).
+SYS_OPEN_TREE, SYS_MOVE_MOUNT, SYS_MOUNT_SETATTR = 428, 429, 442
+OPEN_TREE_CLONE, OPEN_TREE_CLOEXEC, AT_RECURSIVE = 1, 0o2000000, 0x8000
+MOUNT_ATTR_IDMAP, AT_FDCWD = 0x00100000, -100
+AT_EMPTY_PATH, MOVE_MOUNT_F_EMPTY_PATH = 0x1000, 0x4
+
+
+def id_map_line(fs_id: int, mount_id: int) -> str:
+    """The uid_map/gid_map line of the user namespace that shows `fs_id` as `mount_id`."""
+    for name, value in (("fs_id", fs_id), ("mount_id", mount_id)):
+        if not 0 <= value < 2**32 - 2:
+            raise ValueError(f"{name} {value} is not a user or group ID")
+    return f"{fs_id} {mount_id} 1"
+
+
+def mount_attr(userns_fd: int) -> bytes:
+    """struct mount_attr { attr_set, attr_clr, propagation, userns_fd } for MOUNT_ATTR_IDMAP."""
+    return struct.pack("QQQQ", MOUNT_ATTR_IDMAP, 0, 0, userns_fd)
+
+
+def is_mounted(target: str, mountinfo: str = "/proc/self/mountinfo") -> bool:
+    real = os.path.realpath(target)
+    with open(mountinfo) as handle:
+        return any(line.split()[4] == real for line in handle if len(line.split()) > 4)
+
+
+def syscall(number: int, *args) -> int:
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.syscall(number, *args)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return result
+
+
+def make_userns(uid_line: str, gid_line: str) -> tuple[int, subprocess.Popen]:
+    holder = subprocess.Popen(["unshare", "--user", "sleep", "120"])
+    time.sleep(0.3)
+    base = f"/proc/{holder.pid}"
+    with open(f"{base}/setgroups", "w") as handle:
+        handle.write("deny")
+    with open(f"{base}/uid_map", "w") as handle:
+        handle.write(uid_line)
+    with open(f"{base}/gid_map", "w") as handle:
+        handle.write(gid_line)
+    return os.open(f"{base}/ns/user", os.O_RDONLY), holder
+
+
+def idmapped_mount(source: str, target: str, uid_line: str, gid_line: str) -> None:
+    ufd, holder = make_userns(uid_line, gid_line)
+    try:
+        tree = syscall(
+            SYS_OPEN_TREE,
+            AT_FDCWD,
+            source.encode(),
+            OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_RECURSIVE,
+        )
+        attr = mount_attr(ufd)
+        syscall(
+            SYS_MOUNT_SETATTR,
+            tree,
+            b"",
+            AT_EMPTY_PATH,
+            ctypes.create_string_buffer(attr, len(attr)),
+            len(attr),
+        )
+        syscall(SYS_MOVE_MOUNT, tree, b"", AT_FDCWD, target.encode(), MOVE_MOUNT_F_EMPTY_PATH)
+        os.close(tree)
+    finally:
+        os.close(ufd)
+        holder.terminate()
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "--unmount":
+        if is_mounted(argv[2]):
+            subprocess.run(["umount", argv[2]], check=True)
+        return 0
+    if len(argv) != 7:
+        print(__doc__, file=sys.stderr)
+        return 2
+    source, target = argv[1], argv[2]
+    fs_uid, mnt_uid, fs_gid, mnt_gid = (int(value) for value in argv[3:7])
+    if os.geteuid() != 0:
+        print("wgapps-idmap-mount: must run as root", file=sys.stderr)
+        return 1
+    os.makedirs(target, exist_ok=True)
+    if is_mounted(target):  # a second start of the unit: nothing to do
+        return 0
+    idmapped_mount(source, target, id_map_line(fs_uid, mnt_uid), id_map_line(fs_gid, mnt_gid))
+    print(
+        f"wgapps-idmap-mount: {source} -> {target}: {fs_uid}:{fs_gid} shown as {mnt_uid}:{mnt_gid}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

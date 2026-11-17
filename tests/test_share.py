@@ -196,9 +196,94 @@ class ShareTests(unittest.TestCase):
 
     def test_the_usage_and_dispatch_exist(self):
         text = (pathlib.Path(__file__).resolve().parent.parent / "bin/wgapps").read_text()
-        self.assertIn("share [add <path> [name] [--rw]|remove <name>]", text)
+        self.assertIn("share [add <path> [name] [--rw]|remove <name>|idmap-setup", text)
         self.assertIn('share) cmd_share "$@" ;;', text)
         self.assertNotEqual(self.share("nonsense").returncode, 0)
+
+
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+class IdmapShareTests(unittest.TestCase):
+    """The optional idmapped mounts (wgapps share idmap-setup): the parts that need no root."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = pathlib.Path(tmp.name).resolve()
+        self.base = self.home / ".local/share/waydroid-gapps"
+        self.base.mkdir(parents=True)
+        self.mountinfo = self.home / "mountinfo"
+        self.mountinfo.write_text("20 1 8:8 / / rw - ext4 /dev/sda8 rw\n")
+        self.env = {
+            "HOME": str(self.home),
+            "WGAPPS_BASE": str(self.base),
+            "WGAPPS_MOUNTINFO": str(self.mountinfo),
+        }
+
+    def call(self, function, *args):
+        return wgapps_call(self.env, function, *args)
+
+    def mount(self, name):
+        target = self.base / "idmapped" / name
+        target.mkdir(parents=True, exist_ok=True)
+        with self.mountinfo.open("a") as handle:
+            handle.write(f"99 20 8:8 /x {target.resolve()} rw - ext4 /dev/sda8 rw\n")
+        return target
+
+    def test_a_container_id_becomes_the_host_id_of_its_range(self):
+        uid_map = self.home / "uid_map"
+        uid_map.write_text("         0       1000          1\n         1     100000      65536\n")
+        self.assertEqual(self.call("idmap_host_id", "0", str(uid_map)).stdout.strip(), "1000")
+        self.assertEqual(self.call("idmap_host_id", "10144", str(uid_map)).stdout.strip(), "110143")
+        self.assertEqual(self.call("idmap_host_id", "1023", str(uid_map)).stdout.strip(), "101022")
+
+    def test_the_boot_unit_maps_your_ids_to_androids_for_every_share(self):
+        work = self.home / "Work"
+        work.mkdir()
+        self.call("cmd_share", "add", str(work), "Work", "--rw")
+        unit = self.call("idmap_unit", "110143", "110143").stdout
+        uid_gid = f"{__import__('os').getuid()} 110143 {__import__('os').getgid()} 110143"
+        base = self.base
+        host = f'ExecStart=/etc/wgapps/wgapps-idmap-mount "{self.home}/Android-share"'
+        self.assertIn(f'{host} "{base}/idmapped/Host" {uid_gid}', unit)
+        self.assertIn(f'"{work}" "{base}/idmapped/Work" {uid_gid}', unit)
+        self.assertIn(
+            f'ExecStop=/etc/wgapps/wgapps-idmap-mount --unmount "{base}/idmapped/Work"', unit
+        )
+        self.assertIn("Type=oneshot\nRemainAfterExit=yes", unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+
+    def test_an_idmapped_mount_is_what_gets_bound_into_android_when_it_exists(self):
+        before = wgapps_mounts("mount_shares", self.env)
+        self.assertEqual(before["/data/media/0/Host"][0], str(self.home / "Android-share"))
+        target = self.mount("Host")
+        after = wgapps_mounts("mount_shares", self.env)
+        self.assertEqual(after["/data/media/0/Host"], (str(target), "rw"))
+
+    def test_a_directory_that_is_not_in_the_mount_table_is_not_used(self):
+        (self.base / "idmapped/Host").mkdir(parents=True)
+        mounts = wgapps_mounts("mount_shares", self.env)
+        self.assertEqual(mounts["/data/media/0/Host"][0], str(self.home / "Android-share"))
+
+    def test_the_helper_leaves_idmapped_shares_alone(self):
+        share = __import__("helpers").load("wgapps-share")
+        (self.home / "Android-share").mkdir()
+        self.assertEqual(
+            share.rw_shares(self.base, self.home, str(self.mountinfo)),
+            [(self.home / "Android-share", True)],
+        )
+        self.mount("Host")
+        self.assertEqual(share.rw_shares(self.base, self.home, str(self.mountinfo)), [])
+
+    def test_setup_needs_android_running_and_status_says_what_each_share_uses(self):
+        done = self.call("cmd_share", "idmap-setup")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("start Android first", done.stderr)
+        self.assertNotEqual(self.call("cmd_share", "idmap-remove").returncode, 0)
+        status = self.call("cmd_share", "idmap-status").stdout
+        self.assertIn("idmapped mounts: not set up", status)
+        self.assertIn("Host\trw\tACL and helper", status)
+        self.mount("Host")
+        self.assertIn("Host\trw\tidmapped", self.call("cmd_share", "idmap-status").stdout)
 
 
 if __name__ == "__main__":

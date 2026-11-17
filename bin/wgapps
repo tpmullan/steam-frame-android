@@ -77,10 +77,11 @@ usage: wgapps <command> [args]
   apps sync            make the Steam library match: one entry per app, gone apps removed
   apps kind <package> xr|2d|auto
                        treat an app as OpenXR or flat whatever detection says
-  share [add <path> [name] [--rw]|remove <name>]
+  share [add <path> [name] [--rw]|remove <name>|idmap-setup|idmap-remove|idmap-status]
                        folders from this computer inside Android's storage (the Files app):
                        ~/Android-share is always there as "Host" (read-write); added folders,
-                       any directory including your home, are read-only unless --rw (restart Android)
+                       any directory including your home, are read-only unless --rw (restart Android).
+                       idmap-setup (asks for sudo once) makes Android's files yours on disk, no ACLs
   windows [floating|single]
                        show or set how apps open: floating = movable windows inside
                        Android's one panel, single = each app fills it (restart Android)
@@ -1128,12 +1129,129 @@ on property:sys.boot_completed=1
 EOF
 }
 
-mount_shares() {
+# --- idmapped shares (optional, needs root once) -----------------------------
+# With the ACLs above, files Android creates belong to Android's user and the wgapps-share helper hands them
+# to you. An idmapped mount avoids that: root makes, once and at every boot, a second mount of each shared
+# folder in which your ID is shown as Android's storage user (and the reverse), and the rootless container
+# binds that. Ownership on disk stays yours and nothing needs fixing afterwards. `wgapps share idmap-setup`
+# installs the boot unit (it asks for your password through sudo); `idmap-remove` takes it away.
+IDMAP_DIR="$BASE/idmapped"
+IDMAP_UNIT=wgapps-idmap.service
+IDMAP_ROOT_DIR=/etc/wgapps
+IDMAP_UNIT_FILE="/etc/systemd/system/$IDMAP_UNIT"
+
+# Whether a directory is a mount point (the mount table is /proc/self/mountinfo, or $WGAPPS_MOUNTINFO).
+share_is_mounted() {
+	local real
+	real="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+	awk -v d="$real" '$5 == d { found = 1 } END { exit !found }' "${WGAPPS_MOUNTINFO:-/proc/self/mountinfo}"
+}
+
+# The folder to bind into Android for a share: its idmapped mount when that exists, else the folder itself.
+share_source() { # name path
+	if share_is_mounted "$IDMAP_DIR/$1"; then echo "$IDMAP_DIR/$1"; else echo "$2"; fi
+}
+
+# The host ID of a container ID, from the container's uid_map or gid_map.
+idmap_host_id() { # container id, map file
+	awk -v id="$1" '$1 <= id && id < $1 + $3 { print $2 + id - $1; exit }' "$2"
+}
+
+# "uid gid" that Android's storage layer (MediaProvider's FUSE daemon, which makes the files) has on this host.
+idmap_android_ids() {
+	local status uid gid pid
+	# shellcheck disable=SC2016 # the command substitution runs inside Android, not here
+	status="$(asys 'cat /proc/$(pidof com.android.providers.media.module | cut -d" " -f1)/status' 2>/dev/null | tr -d '\r')"
+	uid="$(printf '%s\n' "$status" | awk '/^Uid:/ { print $2 }')"
+	gid="$(printf '%s\n' "$status" | awk '/^Gid:/ { print $2 }')"
+	[[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || return 1
+	pid="$(podman inspect -f '{{.State.Pid}}' "$NAME" 2>/dev/null)" || return 1
+	printf '%s %s\n' "$(idmap_host_id "$uid" "/proc/$pid/uid_map")" "$(idmap_host_id "$gid" "/proc/$pid/gid_map")"
+}
+
+# The systemd unit that makes the mounts at boot.
+idmap_unit() { # mounted-uid mounted-gid
 	local name path mode
+	cat <<EOF
+[Unit]
+Description=wgapps: idmapped mounts of the folders shared with Android
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EOF
+	while IFS=$'\t' read -r name path mode; do
+		printf 'ExecStart=%s/wgapps-idmap-mount "%s" "%s/%s" %s %s %s %s\n' "$IDMAP_ROOT_DIR" "$path" "$IDMAP_DIR" "$name" \
+			"$(id -u)" "$1" "$(id -g)" "$2"
+	done < <(shares_list)
+	while IFS=$'\t' read -r name path mode; do
+		printf 'ExecStop=%s/wgapps-idmap-mount --unmount "%s/%s"\n' "$IDMAP_ROOT_DIR" "$IDMAP_DIR" "$name"
+	done < <(shares_list)
+	cat <<EOF
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+share_idmap_setup() {
+	local ids uid gid name path mode unit
+	running || die "start Android first: the IDs its storage layer uses are read from it"
+	ids="$(idmap_android_ids)" || die "could not read Android's storage user (is Android fully booted?)"
+	read -r uid gid <<<"$ids"
+	[[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || die "could not map Android's storage user to a host ID ($ids)"
+	while IFS=$'\t' read -r name path mode; do mkdir -p "$IDMAP_DIR/$name"; done < <(shares_list)
+	unit="$(mktemp)"
+	idmap_unit "$uid" "$gid" >"$unit"
+	log "Android's storage user is $uid:$gid on this host; your files will show as that user inside Android"
+	log "this needs root once (sudo asks for your password): it installs $IDMAP_ROOT_DIR/wgapps-idmap-mount and $IDMAP_UNIT"
+	if ! {
+		sudo install -d -m 0755 "$IDMAP_ROOT_DIR" &&
+			sudo install -m 0755 -o root -g root "$BIN/wgapps-idmap-mount" "$IDMAP_ROOT_DIR/wgapps-idmap-mount" &&
+			sudo install -m 0644 -o root -g root "$unit" "$IDMAP_UNIT_FILE" &&
+			sudo systemctl daemon-reload &&
+			sudo systemctl enable --now "$IDMAP_UNIT"
+	}; then
+		rm -f "$unit"
+		die "the root step failed; nothing is in use until it succeeds (see: systemctl status $IDMAP_UNIT)"
+	fi
+	rm -f "$unit"
+	while IFS=$'\t' read -r name path mode; do
+		if share_is_mounted "$IDMAP_DIR/$name"; then log "idmapped: $name"; else log "NOT mounted: $name (journalctl -u $IDMAP_UNIT)"; fi
+	done < <(shares_list)
+	log "restart Android for it to apply; the ACLs and the wgapps-share helper are then no longer used for these folders"
+}
+
+share_idmap_remove() {
+	local name path mode
+	[[ -f "$IDMAP_UNIT_FILE" ]] || die "idmapped mounts are not set up"
+	sudo systemctl disable --now "$IDMAP_UNIT" || true
+	sudo rm -f "$IDMAP_UNIT_FILE"
+	sudo rm -rf "$IDMAP_ROOT_DIR"
+	sudo systemctl daemon-reload || true
+	while IFS=$'\t' read -r name path mode; do rmdir "$IDMAP_DIR/$name" 2>/dev/null || true; done < <(shares_list)
+	log "idmapped mounts removed; restart Android for the folders to go back to ACLs and the helper"
+}
+
+share_idmap_status() {
+	local name path mode state="not set up"
+	[[ -f "$IDMAP_UNIT_FILE" ]] && state="set up"
+	echo "idmapped mounts: $state"
+	while IFS=$'\t' read -r name path mode; do
+		printf '%s\t%s\t%s\n' "$name" "$mode" "$(share_is_mounted "$IDMAP_DIR/$name" && echo idmapped || echo "ACL and helper")"
+	done < <(shares_list)
+}
+
+mount_shares() {
+	local name path mode source
 	mkdir -p "$SHARE_DEFAULT_DIR" "$RUNDIR"
 	while IFS=$'\t' read -r name path mode; do
-		bind "$path" "/data/media/0/$name" "$mode"
-		share_prepare "$path" "$([[ "$name" == "$SHARE_DEFAULT_NAME" ]] && echo builtin || echo added)" "$mode"
+		source="$(share_source "$name" "$path")"
+		bind "$source" "/data/media/0/$name" "$mode"
+		if [[ "$source" == "$path" ]]; then
+			share_prepare "$path" "$([[ "$name" == "$SHARE_DEFAULT_NAME" ]] && echo builtin || echo added)" "$mode"
+		fi
 	done < <(shares_list)
 	shares_init_rc >"$RUNDIR/wgapps-shares.rc"
 	shares_script >"$RUNDIR/wgapps-shares.sh"
@@ -1174,6 +1292,7 @@ cmd_share() {
 		} >"$SHARES_CONF.new"
 		mv "$SHARES_CONF.new" "$SHARES_CONF"
 		log "$path shared as '$name' ($mode)$(running && echo "; restart Android for it to apply")"
+		[[ ! -f "$IDMAP_UNIT_FILE" ]] || log "idmapped mounts are set up: run 'wgapps share idmap-setup' again to include it"
 		;;
 	remove)
 		[[ $# -eq 1 ]] || die "usage: wgapps share remove <name>"
@@ -1184,7 +1303,10 @@ cmd_share() {
 		mv "$SHARES_CONF.new" "$SHARES_CONF"
 		log "'$1' removed$(running && echo "; restart Android for it to apply")"
 		;;
-	*) die "usage: wgapps share [add <path> [name] [--rw]|remove <name>]" ;;
+	idmap-setup) share_idmap_setup ;;
+	idmap-remove) share_idmap_remove ;;
+	idmap-status) share_idmap_status ;;
+	*) die "usage: wgapps share [add <path> [name] [--rw]|remove <name>|idmap-setup|idmap-remove|idmap-status]" ;;
 	esac
 }
 

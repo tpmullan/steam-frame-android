@@ -211,6 +211,14 @@ What Android can see and do:
   Frame can keep showing its old content in Android (Android's storage layer caches it; it did for
   over two minutes in testing), and an Android app that appends to it then overwrites your change. Replace
   files rather than editing them in place, and do not edit the same file on both sides at once.
+- **Optional, needs root once: idmapped mounts.** `wgapps share idmap-setup` (it asks for your sudo password)
+  installs a small boot unit (`/etc/wgapps/wgapps-idmap-mount` and `wgapps-idmap.service`, owned by root) that
+  makes a second mount of each shared folder in which your user is shown as Android's storage user, and the
+  reverse. Files then stay owned by you on disk, whoever made them, and the ACLs and the `wgapps-share` helper
+  are no longer used for those folders. `wgapps share idmap-status` shows which method each folder uses,
+  `idmap-remove` undoes it, and after `wgapps share add` run `idmap-setup` again to include the new folder.
+  The mapping and the write direction were checked on a real Linux 7.0 kernel; this has not yet been run on
+  a Frame, so treat it as experimental (needs Linux 5.12 or newer and ext4, xfs or btrfs under the folder).
 - `/`, wgapps' own data and names Android's storage already uses (Download, DCIM, Music and so on) cannot
   be shared.
 

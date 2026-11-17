@@ -33,8 +33,21 @@ def log(msg: str) -> None:
     print(time.strftime("%F %T"), "wgapps-share:", msg, file=sys.stderr, flush=True)
 
 
-def rw_shares(base: pathlib.Path, home: pathlib.Path) -> list[tuple[pathlib.Path, bool]]:
-    """(folder, is the built-in one) for every read-write shared folder that exists."""
+def idmapped(base: pathlib.Path, name: str, mountinfo: str = "/proc/self/mountinfo") -> bool:
+    """Whether the share has an idmapped mount (wgapps share idmap-setup): nothing to fix there."""
+    target = base / "idmapped" / name
+    try:
+        real = str(target.resolve(strict=True))
+        lines = pathlib.Path(mountinfo).read_text().splitlines()
+    except OSError:
+        return False
+    return any(len(parts := line.split()) > 4 and parts[4] == real for line in lines)
+
+
+def rw_shares(
+    base: pathlib.Path, home: pathlib.Path, mountinfo: str = "/proc/self/mountinfo"
+) -> list[tuple[pathlib.Path, bool]]:
+    """(folder, is the built-in one) of each existing read-write share that is not idmapped."""
     found = [(home / "Android-share", True)]
     conf = base / "shares.conf"
     try:
@@ -45,7 +58,16 @@ def rw_shares(base: pathlib.Path, home: pathlib.Path) -> list[tuple[pathlib.Path
         parts = line.split("\t")
         if len(parts) == 3 and parts[2] == "rw" and parts[0] != DEFAULT_NAME:
             found.append((pathlib.Path(parts[1]), False))
-    return [(path, builtin) for path, builtin in found if path.is_dir()]
+    names = {home / "Android-share": DEFAULT_NAME}
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) == 3:
+            names[pathlib.Path(parts[1])] = parts[0]
+    return [
+        (path, builtin)
+        for path, builtin in found
+        if path.is_dir() and not idmapped(base, names.get(path, ""), mountinfo)
+    ]
 
 
 def fix_command(folder: pathlib.Path) -> list[str]:

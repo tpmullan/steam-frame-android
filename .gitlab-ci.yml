@@ -31,7 +31,7 @@ variables:
     bin/wgapps bin/fetch-images.sh tools/deploy.sh tools/build-image.sh
     tools/build-libgbinder.sh tools/build-android-libs.sh tools/build-settings-app.sh tools/build-shell.sh tools/build-quad2d.sh overrides/system/etc/wgapps-net.sh
   PY_FILES: >-
-    bin/wgapps-pad bin/wgapps-battery bin/wgapps-clipboard bin/wgapps-profiles bin/wgapps-share bin/wgapps-appwatch bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
+    bin/wgapps-pad bin/wgapps-battery bin/wgapps-clipboard bin/wgapps-profiles bin/wgapps-share bin/wgapps-idmap-mount bin/wgapps-appwatch bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
     tools/sfa_release.py tests
 
 # --- lint and tests --------------------------------------------------------

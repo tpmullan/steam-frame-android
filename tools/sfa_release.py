@@ -42,6 +42,7 @@ REQUIRED_FILES = (
     "wgapps/bin/wgapps-clipboard",
     "wgapps/bin/wgapps-profiles",
     "wgapps/bin/wgapps-share",
+    "wgapps/bin/wgapps-idmap-mount",
     "wgapps/bin/wgapps-appwatch",
     "wgapps/bin/wgapps-ota",
     "wgapps/bin/wgapps-gen-overrides",
