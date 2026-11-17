@@ -45,9 +45,11 @@ die() {
 usage() {
 	cat <<EOF
 usage: wgapps <command> [args]
-  install [--vanilla]  check prerequisites, download Waydroid's GAPPS images from
+  install [--vanilla] [--hwdec]
+                       check prerequisites, download Waydroid's GAPPS images from
                        Waydroid, extract them, add the Android Steam shortcut;
-                       --vanilla installs the images without Google apps
+                       --vanilla installs the images without Google apps;
+                       --hwdec also installs the optional hardware video decoder
   update [tag|ref]     replace these scripts and overrides with a released image
                        (default: latest); Android data is not touched
   rollback             undo the last update
@@ -82,6 +84,10 @@ usage: wgapps <command> [args]
                        ~/Android-share is always there as "Host" (read-write); added folders,
                        any directory including your home, are read-only unless --rw (restart Android).
                        idmap-setup (asks for sudo once) makes Android's files yours on disk, no ACLs
+  hwdec [status|install|on|off|remove]
+                       the optional hardware video decoder (4K H.264, HEVC, VP9 through the SoC's
+                       decoder); install unpacks the checked add-on from this release and turns it on.
+                       UNSTABLE, in testing: it has crashed a Frame's kernel once (see hwdec/NOTICE.md)
   windows [floating|single]
                        show or set how apps open: floating = movable windows inside
                        Android's one panel, single = each app fills it (restart Android)
@@ -496,8 +502,19 @@ hw_decode_node() {
 	echo "$node"
 }
 
+# The add-on is used only when it is installed, turned on (wgapps hwdec on; install turns it on) and this
+# user may open the decoder node. $BASE/hwdec-enabled holds "on" or "off"; no file means off.
+HWDEC_FLAG="$BASE/hwdec-enabled"
+HWDEC_PKG="$BASE/hwdec"
+
+hw_decode_flag() {
+	local value=off
+	if [[ -f "$HWDEC_FLAG" ]]; then read -r value <"$HWDEC_FLAG" || true; fi
+	[[ "$value" == on ]]
+}
+
 hw_decode_enabled() {
-	[[ -x "$HWDEC_DIR/$HWDEC_SERVICE" ]] && hw_decode_node >/dev/null
+	hw_decode_flag && [[ -x "$HWDEC_DIR/$HWDEC_SERVICE" ]] && hw_decode_node >/dev/null
 }
 
 # The init file for the service. It runs as root: inside the rootless container that is the host
@@ -584,6 +601,7 @@ EOF
 mount_hw_decode() {
 	local f node
 	HW_DECODE_NODE=""
+	hw_decode_flag || return 0
 	[[ -x "$HWDEC_DIR/$HWDEC_SERVICE" ]] || return 0
 	node="$(hw_decode_node)" || {
 		log "hardware video decode: no usable V4L2 decoder node; Android keeps its software codecs"
@@ -2203,15 +2221,67 @@ steam_running() { pgrep -x steam >/dev/null; }
 
 image_flavor() { cat "$BASE/flavor" 2>/dev/null || echo GAPPS; }
 
-cmd_install() {
-	local flavor
-	flavor="$(image_flavor)"
-	case "${1:-}" in
-	--vanilla) flavor=VANILLA ;;
-	--gapps) flavor=GAPPS ;;
-	"") ;;
-	*) die "usage: wgapps install [--vanilla|--gapps]" ;;
+# --- the optional hardware decode add-on ----------------------------------------
+hwdec_installed() { [[ -x "$HWDEC_DIR/$HWDEC_SERVICE" ]]; }
+
+hwdec_status_value() { # key: package, installed or current
+	python3 "$BIN/wgapps-hwdec" status "$HWDEC_PKG" "$HWDEC_DIR" 2>/dev/null | awk -F= -v k="$1" '$1 == k { print $2 }'
+}
+
+cmd_hwdec() {
+	local action="${1:-status}" pkg installed current node
+	case "$action" in
+	status)
+		pkg="$(hwdec_status_value package)"
+		installed="$(hwdec_status_value installed)"
+		current="$(hwdec_status_value current)"
+		node="$(hw_decode_node || true)"
+		echo "add-on in this release: ${pkg:-missing}"
+		echo "installed:              ${installed:-no}$([[ "$current" == no ]] && echo " (a newer one is in this release: wgapps hwdec install)")"
+		echo "turned on:              $(hw_decode_flag && echo yes || echo no)"
+		echo "decoder node:           ${node:-none usable by this user}"
+		echo "used at next start:     $(hw_decode_enabled && echo yes || echo no)"
+		;;
+	install)
+		python3 "$BIN/wgapps-hwdec" install "$HWDEC_PKG" "$HWDEC_DIR" || die "hardware decode was not installed"
+		mkdir -p "$BASE"
+		echo on >"$HWDEC_FLAG"
+		log "hardware video decode installed and turned on"
+		log "WARNING: hardware decode is unstable and in testing: on one Frame this decoder's firmware faulted and the kernel crashed (see hwdec/NOTICE.md)."
+		log "If the Frame reboots shortly after Android starts, run: wgapps hwdec off"
+		hw_decode_node >/dev/null || log "note: this user cannot open a V4L2 decoder node here, so Android keeps its software codecs"
+		if running; then log "restart Android for it to apply"; fi
+		;;
+	on)
+		hwdec_installed || die "hardware decode is not installed (wgapps hwdec install)"
+		mkdir -p "$BASE"
+		echo on >"$HWDEC_FLAG"
+		log "hardware video decode turned on$(running && echo "; restart Android for it to apply")"
+		;;
+	off)
+		mkdir -p "$BASE"
+		echo off >"$HWDEC_FLAG"
+		log "hardware video decode turned off$(running && echo "; restart Android for it to apply")"
+		;;
+	remove)
+		rm -rf "$HWDEC_DIR" "$HWDEC_FLAG"
+		log "hardware video decode removed$(running && echo "; restart Android for it to apply")"
+		;;
+	*) die "usage: wgapps hwdec [status|install|on|off|remove]" ;;
 	esac
+}
+
+cmd_install() {
+	local flavor hwdec=0 arg
+	flavor="$(image_flavor)"
+	for arg in "$@"; do
+		case "$arg" in
+		--vanilla) flavor=VANILLA ;;
+		--gapps) flavor=GAPPS ;;
+		--hwdec) hwdec=1 ;;
+		*) die "usage: wgapps install [--vanilla|--gapps] [--hwdec]" ;;
+		esac
+	done
 	check_prereqs
 	mkdir -p "$BASE/images" "$RUNDIR"
 	echo "$flavor" >"$BASE/flavor"
@@ -2225,6 +2295,7 @@ cmd_install() {
 	fi
 	"$BIN/fetch-images.sh" || die "download failed; run 'wgapps install' again to resume"
 	cmd_prepare --force
+	if [[ "$hwdec" == 1 ]]; then cmd_hwdec install; fi
 	if [[ "${WGAPPS_SKIP_SHORTCUTS:-0}" == "1" ]]; then
 		log "skipping Steam shortcuts (WGAPPS_SKIP_SHORTCUTS=1)"
 	elif ! python3 "$BIN/steam-shortcuts.py" add Android; then
@@ -2271,6 +2342,18 @@ image_ref() {
 	fi
 }
 
+# What was put into lib/ by hand or by `wgapps hwdec install` (the Settings and shell APKs, the hardware
+# decoder) is not in the release's lib/, so `update` carries over whatever the new lib/ does not have.
+update_keep_installed_libs() { # old lib, new lib
+	local item
+	[[ -d "$1" ]] || return 0
+	mkdir -p "$2"
+	for item in "$1"/* "$1"/.[!.]*; do
+		[[ -e "$item" ]] || continue
+		[[ -e "$2/${item##*/}" ]] || cp -a "$item" "$2/"
+	done
+}
+
 cmd_update() {
 	local ref cid stage="$BASE/.staging" prev="$BASE/.previous" item
 	ref="$(image_ref "${1:-}")"
@@ -2290,12 +2373,13 @@ cmd_update() {
 	[[ -f "$stage/bin/wgapps" ]] || die "image $ref has no bin/wgapps"
 	rm -rf "$prev"
 	mkdir -p "$prev"
-	for item in bin lib overrides VERSION image; do
+	for item in bin lib overrides hwdec VERSION image; do
 		if [[ -e "$BASE/$item" ]]; then mv "$BASE/$item" "$prev/"; fi
 	done
-	for item in bin lib overrides VERSION; do
+	for item in bin lib overrides hwdec VERSION; do
 		if [[ -e "$stage/$item" ]]; then mv "$stage/$item" "$BASE/"; fi
 	done
+	update_keep_installed_libs "$prev/lib" "$BASE/lib"
 	chmod 0755 "$BASE"/bin/*
 	echo "$ref" >"$BASE/image"
 	rm -rf "$stage"
@@ -2348,6 +2432,18 @@ cmd_report() {
 		podman --version 2>&1
 		df -h "$BASE" "$HOME" 2>&1
 		free -m 2>&1
+		section "optional features"
+		cmd_hwdec status 2>&1
+		cmd_share idmap-status 2>&1
+		echo "xr scale: $(xr_scale 2>&1)  mode: $(mode_saved 2>&1)"
+		echo "idmap unit: $(systemctl is-active wgapps-idmap.service 2>&1)  stay-awake unit: $(systemctl --user is-active wgapps-stay-awake.service 2>&1)"
+		section "kernel: boots and crash-relevant lines (this boot, then the previous one)"
+		journalctl --list-boots --no-pager 2>&1 | tail -n 5
+		echo "--- this boot:"
+		journalctl -b -k --no-pager 2>&1 | grep -E 'qcom-iris|Unable to handle|Oops|BUG:|panic|oom-kill|Out of memory|segfault' | tail -n 30
+		echo "--- previous boot (why it ended, last lines and crash-relevant lines):"
+		journalctl -b -1 -k --no-pager 2>&1 | grep -E 'qcom-iris|Unable to handle|Oops|BUG:|panic|oom-kill|Out of memory|segfault' | tail -n 30
+		journalctl -b -1 --no-pager -n 15 2>&1 | cut -c1-200
 		section "steam"
 		echo "steam running: $(pgrep -x steam >/dev/null && echo yes || echo no)"
 		pgrep -ax gamescope 2>&1 | cut -c1-200
@@ -2415,6 +2511,7 @@ main() {
 	gpu) cmd_gpu "$@" ;;
 	xr) cmd_xr "$@" ;;
 	share) cmd_share "$@" ;;
+	hwdec) cmd_hwdec "$@" ;;
 	mode) cmd_mode "$@" ;;
 	view) cmd_view "$@" ;;
 	report) cmd_report "$@" ;;

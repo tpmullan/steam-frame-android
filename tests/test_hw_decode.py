@@ -29,7 +29,10 @@ class HwDecodeTests(unittest.TestCase):
             "WGAPPS_V4L2_DECODER": "/dev/null",
         }
 
-    def install(self, service=True):
+    def install(self, service=True, on=True):
+        # The add-on is used only when it is turned on (wgapps hwdec on / install).
+        self.base.mkdir(parents=True, exist_ok=True)
+        (self.base / "hwdec-enabled").write_text("on\n" if on else "off\n")
         for rel in (RC, "vendor/lib64/libv4l2_codec2_components.so", "vendor/lib64/libchrome.so"):
             path = self.dir / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +52,15 @@ class HwDecodeTests(unittest.TestCase):
         self.assertEqual(wgapps_mounts("mount_hw_decode", self.env), {})
         props = self.call("hw_decode_enabled && echo on || echo off")
         self.assertEqual(props.stdout.strip(), "off")
+
+    def test_an_installed_decoder_that_is_turned_off_is_not_used(self):
+        self.install(on=False)
+        self.assertEqual(wgapps_mounts("mount_hw_decode", self.env), {})
+        self.assertEqual(
+            self.call("hw_decode_enabled && echo on || echo off").stdout.strip(), "off"
+        )
+        (self.base / "hwdec-enabled").unlink()  # no file means off too
+        self.assertEqual(wgapps_mounts("mount_hw_decode", self.env), {})
 
     def test_nothing_changes_without_a_usable_decoder_node(self):
         self.install()

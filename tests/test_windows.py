@@ -140,7 +140,14 @@ class ReportTests(unittest.TestCase):
             done = wgapps_call(env, "cmd_report", str(out))
             self.assertEqual(done.returncode, 0, done.stderr)
             text = out.read_text()
-            for heading in ("===== wgapps =====", "===== steam =====", "init: boot loop"):
+            for heading in (
+                "===== wgapps =====",
+                "===== steam =====",
+                "===== optional features =====",
+                "===== kernel: boots and crash-relevant lines",
+                "add-on in this release:",
+                "init: boot loop",
+            ):
                 self.assertIn(heading, text)
             self.assertIn("ro.hardware.egl=mesa", text)
             self.assertNotIn("abc123", text)

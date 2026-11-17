@@ -115,16 +115,23 @@ recentre, Wolvic logged `reference space changed` and the sphere stayed centred 
 (cyan|blue edge straight ahead in the SteamVR screenshot). The Frame's screenshots of a YouTube 360 clip in
 fullscreen were black with and without the hardware decoder; use the local clip for visual checks.
 
-## Hardware video decode
+## Hardware video decode (optional, unstable, in testing)
 
-The SoC's V4L2 decoder (iris, `/dev/video-dec0` = `/dev/video22`: H.264, HEVC, VP9 up to 8192x8192) is
-usable from Android through a Codec2 V4L2 service built from AOSP `external/v4l2_codec2` with six patches
-(`tools/v4l2-codec2/`, README there). With it installed under `~/.local/share/waydroid-gapps/lib/v4l2-codec2/`,
-`wgapps start` mounts it into the container; without it Android has only Google's software codecs (VP9
-capped at 2048x2048), which is why YouTube stops at 1080p. `tools/decode-check.py` is the acceptance test
-(host decoder, container node, Android's codec list, and a 4K clip played in Chrome that must use
-`c2.v4l2.vp9.decoder` while the iris interrupt counter climbs). Debugging it: see the README there
-(strace inside the container, the kernel's `qcom-iris` messages, `v4l2-ctl` on the host).
+The SoC's V4L2 decoder (iris, `/dev/video-dec0` = `/dev/video22`: H.264, HEVC, VP9 up to 8192x8192) is usable
+from Android through a Codec2 V4L2 service built from AOSP `external/v4l2_codec2` with six patches
+(`tools/v4l2-codec2/`, README there). It is an optional add-on in the release: `wgapps hwdec install` (or
+`wgapps install --hwdec`) unpacks and checks it into `~/.local/share/waydroid-gapps/lib/v4l2-codec2` and turns it
+on; `wgapps hwdec status|on|off|remove` manage it, and `wgapps start` mounts it into the container when it is on and
+the decoder node is usable. Without it Android has only Google's software codecs (VP9 capped at 2048x2048), which is
+why YouTube stops at 1080p. `tools/decode-check.py` is the acceptance test (host decoder, container node, Android's
+codec list, and a 4K clip played in Chrome that must use `c2.v4l2.vp9.decoder` while the iris interrupt counter
+climbs). Debugging it: see the README there (strace inside the container, the kernel's `qcom-iris` messages,
+`v4l2-ctl` on the host).
+
+**It can crash the machine.** A `qcom-iris ... received system error of type 0x5000003` in `journalctl -k`, followed
+by `Unable to handle kernel paging request`, rebooted a Frame about a minute after Android started (2026-11-17). If
+the Frame reboots after starting Android, read `journalctl -b -1 -k` and turn the add-on off (`wgapps hwdec off`)
+before anything else. Do not start Android on a Frame you are about to leave unattended while this is unexplained.
 
 ## Render resolution (why OpenXR apps looked soft)
 

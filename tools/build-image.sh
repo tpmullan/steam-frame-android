@@ -24,9 +24,17 @@ for lib in libwgapps_xr_gles.so libwgapps_gbm_lock.so libwgapps_props.so libwgap
 		exit 1
 	}
 done
+[[ -f "$root/hwdec/wgapps-hwdec.tar.xz" && -f "$root/hwdec/SHA256SUMS" ]] || {
+	echo "build-image: missing hwdec/wgapps-hwdec.tar.xz or SHA256SUMS (tools/package-hwdec.py)" >&2
+	exit 1
+}
+(cd "$root/hwdec" && sha256sum -c SHA256SUMS >/dev/null) || {
+	echo "build-image: hwdec/wgapps-hwdec.tar.xz does not match hwdec/SHA256SUMS" >&2
+	exit 1
+}
 ctx="$(mktemp -d)"
 trap 'rm -rf "$ctx"' EXIT
-cp -R "$root/bin" "$root/lib" "$root/overrides" "$root/LICENSE" "$root/Containerfile" "$ctx/"
+cp -R "$root/bin" "$root/lib" "$root/overrides" "$root/hwdec" "$root/LICENSE" "$root/Containerfile" "$ctx/"
 printf '%s\n' "$version" >"$ctx/VERSION"
 
 docker buildx inspect sfa-builder >/dev/null 2>&1 ||

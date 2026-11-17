@@ -1,11 +1,25 @@
 # V4L2 Codec2 hardware video decode for Waydroid on the Steam Frame
 
+> Users do not build this. A release ships the result as the optional add-on `hwdec/wgapps-hwdec.tar.xz`
+> (`wgapps install --hwdec` or `wgapps hwdec install`); this page is how it is built, for rebuilding it. After a
+> rebuild, `tools/package-hwdec.py TREE` packs the install tree into `hwdec/` (same bytes for the same files,
+> with `SHA256SUMS`), and `hwdec/NOTICE.md` is where the provenance is kept.
+
 The Frame's SoC decodes H.264, HEVC and VP9 up to 8K in hardware (the `iris` V4L2 driver,
 `/dev/video-dec0`), but Waydroid's LineageOS 20 image only has Google's software codecs, which is why
 YouTube stops at 1080p. AOSP's `external/v4l2_codec2` is a Codec2 HAL that drives V4L2 decoders; these
 patches make it work on this image and this driver, and `bin/wgapps` (`mount_hw_decode`) installs it.
 `tools/decode-check.py` is the acceptance test (host decoder, container node, Android codec list, and a
 4K clip played in Chrome that must use `c2.v4l2.vp9.decoder`).
+
+> **Warning (2026-11-17): this can crash the whole machine.** On the author's Frame the SoC's video codec
+> (`qcom-iris`) twice reported a firmware error (`received system error of type 0x5000003`) a minute or two
+> after Android started with this service installed, and the second one ended in a kernel oops
+> (`Unable to handle kernel paging request`) that rebooted the Frame. The cause (what asks the decoder to
+> decode, and what faults its firmware) is not known; 150 scripted Wolvic runs decoded fine before. It is not
+> part of the release image, so only a hand-built install has it. If the Frame reboots shortly after Android
+> starts, move `lib/v4l2-codec2` aside (Android falls back to software decoding) and look in
+> `journalctl -k` for `qcom-iris`.
 
 ## Build
 

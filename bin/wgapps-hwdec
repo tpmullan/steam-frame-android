@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Check and unpack the optional hardware video decode add-on (hwdec/wgapps-hwdec.tar.xz).
+
+The archive ships in the release image next to a SHA256SUMS file. Nothing is unpacked unless
+the checksum matches, and unpacking is strict: only plain files under vendor/ or system/ with
+ordinary names, never a link, device, absolute path or "..", and the decoder service itself
+must be among them. The files go into a new directory that replaces the installed one in a
+single rename, so an interrupted install leaves the old one intact.
+
+Usage: wgapps-hwdec verify PKG_DIR
+       wgapps-hwdec install PKG_DIR DEST
+       wgapps-hwdec status PKG_DIR DEST
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tarfile
+
+ARCHIVE = "wgapps-hwdec.tar.xz"
+SERVICE = "vendor/bin/hw/android.hardware.media.c2@1.0-service-v4l2-64"
+NAME_RE = re.compile(r"^(vendor|system)/[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$")
+MARKER = ".package-sha256"
+MAX_BYTES = 64 * 1024 * 1024  # the real package is about 5 MB unpacked
+
+
+class PackageError(Exception):
+    pass
+
+
+def expected_sha256(pkg: pathlib.Path) -> str:
+    try:
+        lines = (pkg / "SHA256SUMS").read_text().splitlines()
+    except OSError as error:
+        raise PackageError(f"no SHA256SUMS in {pkg}") from error
+    for line in lines:
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == ARCHIVE and re.fullmatch(r"[0-9a-f]{64}", parts[0]):
+            return parts[0]
+    raise PackageError(f"SHA256SUMS does not list {ARCHIVE}")
+
+
+def verified_archive(pkg: pathlib.Path) -> pathlib.Path:
+    """The archive's path once its checksum matches SHA256SUMS."""
+    archive = pkg / ARCHIVE
+    if not archive.is_file():
+        raise PackageError(f"{archive} is missing (this release has no hardware decode add-on)")
+    digest = hashlib.sha256()
+    with archive.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    if digest.hexdigest() != expected_sha256(pkg):
+        raise PackageError(f"{archive} does not match its SHA256SUMS; not unpacking it")
+    return archive
+
+
+def check_member(info: tarfile.TarInfo) -> None:
+    if not info.isreg():
+        raise PackageError(
+            f"{info.name}: only plain files are allowed (no links, devices or directories)"
+        )
+    if not NAME_RE.fullmatch(info.name) or ".." in info.name.split("/"):
+        raise PackageError(f"{info.name}: not a path the add-on may contain")
+    if info.size > MAX_BYTES:
+        raise PackageError(f"{info.name}: too big")
+
+
+def install(pkg: pathlib.Path, dest: pathlib.Path) -> int:
+    archive = verified_archive(pkg)
+    new = dest.with_name(dest.name + ".new")
+    shutil.rmtree(new, ignore_errors=True)
+    names = []
+    total = 0
+    try:
+        with tarfile.open(archive, "r:xz") as tar:
+            members = tar.getmembers()
+            for info in members:
+                check_member(info)
+                total += info.size
+            if total > MAX_BYTES:
+                raise PackageError("the archive unpacks to more than expected")
+            for info in members:
+                target = new / info.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tar.extractfile(info)
+                with source as reader, target.open("wb") as writer:
+                    shutil.copyfileobj(reader, writer)
+                target.chmod(0o755 if info.mode & 0o111 else 0o644)
+                names.append(info.name)
+        if SERVICE not in names:
+            raise PackageError(f"the archive has no {SERVICE}")
+        (new / MARKER).write_text(expected_sha256(pkg) + "\n")
+        old = dest.with_name(dest.name + ".old")
+        shutil.rmtree(old, ignore_errors=True)
+        if dest.exists():
+            os.rename(dest, old)
+        os.rename(new, dest)
+        shutil.rmtree(old, ignore_errors=True)
+    except (tarfile.TarError, OSError, EOFError) as error:
+        shutil.rmtree(new, ignore_errors=True)
+        raise PackageError(f"could not unpack {archive}: {error}") from error
+    except PackageError:
+        shutil.rmtree(new, ignore_errors=True)
+        raise
+    print(f"{len(names)} files installed in {dest}")
+    return 0
+
+
+def status(pkg: pathlib.Path, dest: pathlib.Path) -> int:
+    """Lines "key=value": package (ok/missing/bad), installed (yes/no), current (yes/no/n/a)."""
+    try:
+        verified_archive(pkg)
+        package, digest = "ok", expected_sha256(pkg)
+    except PackageError as error:
+        package, digest = ("missing" if "missing" in str(error) else "bad"), ""
+    installed = (dest / SERVICE).is_file()
+    marker = ""
+    if (dest / MARKER).is_file():
+        marker = (dest / MARKER).read_text().strip()
+    print(f"package={package}")
+    print(f"installed={'yes' if installed else 'no'}")
+    print(
+        f"current={'n/a' if not installed or not digest else ('yes' if marker == digest else 'no')}"
+    )
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    try:
+        if len(argv) == 3 and argv[1] == "verify":
+            verified_archive(pathlib.Path(argv[2]))
+            print("checksum ok")
+            return 0
+        if len(argv) == 4 and argv[1] == "install":
+            return install(pathlib.Path(argv[2]), pathlib.Path(argv[3]))
+        if len(argv) == 4 and argv[1] == "status":
+            return status(pathlib.Path(argv[2]), pathlib.Path(argv[3]))
+    except PackageError as error:
+        print(f"wgapps-hwdec: {error}", file=sys.stderr)
+        return 1
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -181,6 +181,15 @@ Done: `cmd_mode` (get/set; `vr` refused without `lib/WgappsShell.apk`), `mode ho
 
 ---
 
+> **Plan closed 2026-11-17 (release v0.1.5).** Done: Steam mode (catalog, live shortcut sync, attach-launch, windows),
+> the mode switch, the Rust VR shell integration, the Settings screens (device profile, launch type, mode),
+> hardware video decode, full-resolution OpenXR, the EGL layer against the Wolvic fullscreen-exit freeze
+> (0 freezes in 146 exits, against 3 in 96 without it), and folder sharing with the Files app (`wgapps share`,
+> optional idmapped mounts). CI runs in its own images and is green. Not in this release: the 3D home and the
+> Rust launcher's remaining work (`2026-11-16-vr-shell-next-project.md`). Still open outside the plan:
+> issues 1 and 2 wait for their reporters; the idmapped mounts are experimental until Android has been
+> restarted with the mount in place on a Frame.
+
 ## Self-Review
 
 - **Spec coverage:** Steam entries per app (Tasks 1, 2), tight Steam mode and attach-launch (Task 3), desktop management inside one panel (Task 4), VR-native launcher (V1, V2), optional 3D home (V3), passthrough (S5, V4), optional shell and a mode switch (M). The decision "one container" is in Global Constraints.

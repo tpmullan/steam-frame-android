@@ -10,11 +10,34 @@ on the Valve Steam Frame and launch them from the Steam library.
 - Hardware GPU (Mesa freedreno), audio, network, Google sign-in, offline
   downloads, and the Frame controllers as a TV remote in apps.
 
-**This project ships no Android or Google software.** The install step
+**This project ships no Android or Google software**, with one optional exception. The install step
 downloads Waydroid's GAPPS images on your Frame directly from Waydroid's
 servers (the same index `waydroid init` uses) and checks their SHA-256
 against it. What this repo and its image contain is our launcher, controller
-forwarder, Steam integration and small runtime overrides.
+forwarder, Steam integration and small runtime overrides. The exception is the opt-in
+[hardware video decode add-on](#hardware-video-decode-optional-unstable-in-testing): a 1 MB archive of
+Apache-2.0 AOSP code built for this image, unpacked and used only if you ask for it
+(`wgapps install --hwdec` or `wgapps hwdec install`; see [hwdec/NOTICE.md](hwdec/NOTICE.md)).
+
+## What it does
+
+| Feature | What you get | How |
+|---|---|---|
+| Android in the Steam library | Every Android app a Steam entry: live shortcut sync, launch, switch and quit from Steam | [Steam mode](#steam-mode-every-android-app-in-the-steam-library), `wgapps apps sync`, `wgapps windows` |
+| Google apps or not | Waydroid's LineageOS 20 with Google apps (Play, sign-in), or without | `wgapps install [--vanilla]`, `wgapps gsf-id` |
+| Per-app device profiles | Make an app see another device model (a Quest, a Pico) | [Per-app overrides](#per-app-overrides), `wgapps app` |
+| Settings screens | In Android's Settings: Device profile per app, launch type per app, Steam Frame mode | [The Settings screen](#the-settings-screen) |
+| VR mode (early) | A Rust VR shell: app library, apps as windows in the headset, controller pointer | [VR mode](#vr-mode-early), `wgapps mode`, `wgapps view` |
+| Full-resolution OpenXR | Wolvic and other OpenXR apps render at the panel's resolution | [Render resolution](#render-resolution), `wgapps xr scale` |
+| Your files in Android | The Frame's folders in Android's Files app, optionally idmapped so files stay yours | [Files app](#your-files-in-androids-files-app), `wgapps share` |
+| Hardware video decode (optional, **unstable, in testing**) | 4K H.264 and VP9 on the SoC's decoder instead of in software | [Hardware video decode](#hardware-video-decode-optional-unstable-in-testing), `wgapps hwdec` |
+| Wolvic freeze fix | A GLES layer avoids a Mesa deadlock that froze Wolvic after fullscreen video | [Freeze after leaving fullscreen video](#freeze-after-leaving-fullscreen-video), automatic |
+| GPU choice | Mesa (default) or ANGLE for OpenGL ES | [GPU option: ANGLE](#gpu-option-angle), `wgapps gpu egl` |
+| Updates | Update, roll back, uninstall; Android data is kept | [Update, roll back, remove](#update-roll-back-remove) |
+| Diagnostics | One file to attach to a bug report; log runbook | [Troubleshooting](#troubleshooting-and-reporting), `wgapps report` |
+
+`wgapps help` lists every command with its options. Public testers: [docs/testing.md](docs/testing.md) says what is solid, what is
+still in testing and how to report.
 
 ## Install
 
@@ -29,8 +52,10 @@ c=$(podman create ghcr.io/tpmullan/steam-frame-android:latest none) \
 
 `install` checks prerequisites, downloads about 1.3 GB from Waydroid
 (resumable: run it again if the connection drops), extracts the images and
-adds an **Android** entry to the Steam library (close Steam first, or add it
-later as printed).
+adds an **Android** entry to the Steam library (while Steam runs it does so through
+Steam's own client API, so you do not need to close Steam; if that is not possible it prints the
+command to run later). `wgapps install --hwdec` also installs the optional hardware video
+decoder (see [below](#hardware-video-decode-optional-unstable-in-testing)).
 
 For Android without Google apps, run `wgapps install --vanilla` instead (the
 choice is remembered). To switch an existing install, run it again with the
@@ -45,10 +70,10 @@ Then:
    `~/.local/share/waydroid-gapps/bin/wgapps gsf-id` while Android runs,
    then enter the number at <https://www.google.com/android/uncertified>
    and wait a few minutes.
-3. Add a Steam entry per app (with Steam closed):
-   `~/.local/share/waydroid-gapps/bin/steam-shortcuts.py add Plex com.plexapp.android`.
-   In Steam, keep the default **Gamepad** controller layout for these
-   entries.
+3. Add a Steam entry per app: `wgapps apps sync` adds one for every app you can open, or
+   `~/.local/share/waydroid-gapps/bin/steam-shortcuts.py add Plex com.plexapp.android` for one
+   (both work while Steam runs). In Steam, keep the default **Gamepad** controller layout for
+   these entries.
 
 ## Controls
 
@@ -184,6 +209,36 @@ layer in `xr-layer/` multiplies the recommendation by `wgapps xr scale` (default
 2160x2160). `wgapps xr scale 1.0` turns it off, `wgapps xr scale default` restores 1.25, and a change applies
 the next time Android starts. It costs about 56% more pixels; heavy scenes may need a lower value.
 
+## Hardware video decode (optional, unstable, in testing)
+
+**Status: unstable, in testing.** It is optional and off unless you ask for it, and it is not recommended on a
+Frame you leave unattended. Android's own image has only Google's software video codecs, so YouTube stops at 1080p and 4K is
+choppy or refused. The SoC's decoder (`qcom-iris`: H.264, HEVC and VP9 up to 8K) is a V4L2 device, and the
+add-on is AOSP's Codec2 V4L2 service, built for this image with six patches
+([tools/v4l2-codec2](tools/v4l2-codec2/README.md)), so Android can use it.
+
+```sh
+wgapps install --hwdec        # at install time, or later:
+wgapps hwdec install          # unpacks the add-on from this release (checksum checked) and turns it on
+wgapps hwdec status           # in the release? installed? on? decoder node usable?
+wgapps hwdec off | on         # switch it without removing it
+wgapps hwdec remove           # delete it
+```
+
+A change applies the next time Android starts. `update` keeps an installed add-on (and tells you in
+`hwdec status` when the new release carries a newer one).
+
+What was verified: Chrome and Wolvic decode a 4K VP9 clip and a YouTube 4K video on the decoder
+(Android lists `c2.v4l2.vp9.decoder` and friends, the decoder's interrupt counter climbs), the add-on's
+own check is `tools/decode-check.py`, and 150 scripted Wolvic runs decoded without a fault.
+
+**Warning:** on one Frame the SoC's video codec reported a firmware error a minute or two after Android
+started with the add-on on, and the kernel then crashed (`Unable to handle kernel paging request`),
+rebooting the whole Frame. The cause is not known. Hence it is optional, unstable and still in testing: it is off unless you install it, and nothing else depends on it. If your Frame
+reboots shortly after Android starts, run `wgapps hwdec off` and look in `journalctl -k` for `qcom-iris`.
+`hwdec status` says whether the add-on will be used. HEVC is not offered by Android even so
+(H.264 and VP9 are).
+
 ## Your files in Android's Files app
 
 Android's own storage is private to the container, so nothing from the Frame was visible in the Files app.
@@ -260,17 +315,44 @@ pointing at the panel and OpenXR apps that use Vulkan work. OpenXR apps that
 use OpenGL ES with a depth buffer do not (OpenGL ES 3.1 only, and SteamVR
 cannot share the depth image), which is why it is not the default.
 
-## Reporting a problem
+## Troubleshooting and reporting
 
-`wgapps report` writes a diagnostics file (no passwords or account data) to attach
-to an issue; [docs/runbook-logs.md](docs/runbook-logs.md) says when to run it.
+Report problems as an issue on [GitHub](https://github.com/tpmullan/steam-frame-android/issues). Run
+`wgapps report` first and post its output in the issue (it holds no passwords or account data; skim it
+before posting, since logcat can show app names). [docs/runbook-logs.md](docs/runbook-logs.md) says when to run
+it and how to read Android's and the kernel's logs; [docs/testing.md](docs/testing.md) is the guide for
+testers.
+
+- **The Frame reboots or drops off the network a minute or two after Android starts:** look at
+  `journalctl -b -1 -k` (the previous boot's kernel log). A `qcom-iris ... system error` followed by a
+  kernel oops is the hardware decoder add-on: `wgapps hwdec off`.
+- **The Frame goes to sleep and SSH drops** (deep suspend about a minute after idle): keep it awake for
+  SSH while the display may still turn off, with a user service that blocks sleep:
+
+  ```sh
+  mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/wgapps-stay-awake.service <<'EOF'
+  [Unit]
+  Description=keep the Frame awake and reachable (blocks suspend; the display may still turn off)
+  [Service]
+  ExecStart=/usr/bin/systemd-inhibit --what=sleep --who=wgapps --why="keep the Frame reachable over ssh" --mode=block /usr/bin/sleep infinity
+  Restart=always
+  [Install]
+  WantedBy=default.target
+  EOF
+  systemctl --user daemon-reload && systemctl --user enable --now wgapps-stay-awake.service
+  ```
+
+  Undo with `systemctl --user disable --now wgapps-stay-awake.service`.
+- **Android loops at boot, or `wgapps start` from a terminal fails:** see the bug write-ups in
+  [docs/bugs](docs/bugs) (seccomp profile, keystore owner, the wrong desktop session).
+- **Android's shared folders show old content:** see the limits under
+  [Your files in Android's Files app](#your-files-in-androids-files-app).
 
 ## Known limits
 
-- Video decodes in software by default (fine for 1080p H.264/HEVC; YouTube stops at 1080p). Hardware
-  decoding through the SoC's V4L2 decoder works when the Codec2 V4L2 service built from
-  [tools/v4l2-codec2](tools/v4l2-codec2/README.md) is installed in `lib/v4l2-codec2/`; the build is not
-  part of the release.
+- Video decodes in software by default (fine for 1080p H.264/HEVC; YouTube stops at 1080p). The optional
+  [hardware decode add-on](#hardware-video-decode-optional-unstable-in-testing) removes that limit for H.264
+  and VP9, but is unstable and in testing: it has crashed a Frame's kernel once.
 - Netflix and other Widevine L1 apps do not work (uncertified device).
 - Lepton is not used. `wgapps` gives Android its own seccomp profile (everything
   allowed except kernel modules, kexec, clock changes and `open_by_handle_at`;
@@ -284,7 +366,9 @@ to an issue; [docs/runbook-logs.md](docs/runbook-logs.md) says when to run it.
 
 GPL-3.0-or-later; see [LICENSE](LICENSE). This covers this project's own
 files only. Waydroid's images and the Google apps in them are downloaded
-from Waydroid under their own terms and are not part of this project.
+from Waydroid under their own terms and are not part of this project. The optional
+hardware decode add-on in `hwdec/` is AOSP code under the Apache License 2.0 (and `libchrome`
+under BSD-3-Clause), with the notice and license text beside it ([hwdec/NOTICE.md](hwdec/NOTICE.md)).
 
 ## Development
 
@@ -298,6 +382,17 @@ from Waydroid under their own terms and are not part of this project.
   shfmt, ruff. CI runs on GitLab (`.gitlab-ci.yml`).
 - `tools/deploy.sh` copies a checkout to a Frame over SSH in the release
   layout.
+- Tools for testing on a Frame without a person in the headset (see
+  [docs/debugging-the-frame.md](docs/debugging-the-frame.md)): `tools/gpu-trial.py` (regression checks and the
+  unattended Wolvic fullscreen-exit harness, which dumps native stacks on a freeze), `tools/decode-check.py`
+  (hardware decode end to end), `tools/frame-chaperone.py` (read and rotate SteamVR's zero poses),
+  `tools/frame-pointer.py` and `tools/frame-aim-sweep.py` (simulated controllers and aim),
+  `tools/xr-fixtures/` (a 360 test clip and page), `tools/package-hwdec.py` (pack a rebuilt decoder tree
+  into `hwdec/`), `tools/build-android-libs.sh` (the OpenXR and GLES layers, the allocator lock and the
+  property preload).
+- CI runs in its own images; reproduce a failing job exactly by running that image (`python:3.12-alpine`,
+  `koalaman/shellcheck-alpine:v0.10.0`, `mvdan/shfmt:v3.10.0-alpine`) on a throwaway container with the checkout
+  copied in. Several portability bugs (no `/etc/localtime`, busybox `find`) only show there.
 - Releases: development happens in a separate repository. Pushing a
   `vX.Y.Z` tag there builds and checks the image, publishes it as
   `ghcr.io/tpmullan/steam-frame-android:vX.Y.Z` (and `:latest` when it is
