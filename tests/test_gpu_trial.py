@@ -1,5 +1,6 @@
 import importlib.util
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -7,6 +8,7 @@ from unittest import mock
 PATH = pathlib.Path(__file__).resolve().parent.parent / "tools/gpu-trial.py"
 spec = importlib.util.spec_from_file_location("gpu_trial", PATH)
 trial = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = trial  # dataclasses (Python 3.12) look the module up by name
 spec.loader.exec_module(trial)
 
 

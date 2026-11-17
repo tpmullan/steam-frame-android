@@ -61,7 +61,7 @@ esac
 
     def watch(self, package, *extra):
         env = {
-            "PATH": f"{self.tmp}:/usr/bin:/bin",
+            "PATH": f"{self.tmp}:/usr/local/bin:/usr/bin:/bin",
             "FAKE_DIR": str(self.tmp),
             "WGAPPS_CONTAINER": "c",
         }

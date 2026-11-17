@@ -11,7 +11,7 @@ BIN = pathlib.Path(__file__).resolve().parent.parent / "bin"
 def call(base, *args):
     return subprocess.run(
         ["bash", str(BIN / "wgapps"), *args],
-        env={"PATH": "/usr/bin:/bin", "HOME": str(base), "WGAPPS_BASE": str(base)},
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(base), "WGAPPS_BASE": str(base)},
         capture_output=True,
         text=True,
         check=False,

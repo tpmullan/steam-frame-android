@@ -32,7 +32,7 @@ def wgapps_mounts(function, env):
     {destination: (source, options)}."""
     out = subprocess.run(
         ["bash", "-c", MOUNTS_SCRIPT, "bash", str(BIN / "wgapps"), function],
-        env={"PATH": "/usr/bin:/bin", **env},
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin", **env},
         check=True,
         capture_output=True,
         text=True,
@@ -53,7 +53,7 @@ def wgapps_call(env, function, *args):
     """Run a bin/wgapps function with arguments; return the finished process (not checked)."""
     return subprocess.run(
         ["bash", "-c", 'source "$1"; shift; "$@"', "bash", str(BIN / "wgapps"), function, *args],
-        env={"PATH": "/usr/bin:/bin", **env},
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin", **env},
         check=False,
         capture_output=True,
         text=True,

@@ -109,7 +109,7 @@ asys() {
 
 write_props() {
 	local headless="$1" tz
-	tz="$(readlink /etc/localtime)"
+	tz="$(readlink /etc/localtime || true)"
 	tz="${tz#/usr/share/zoneinfo/}"
 	mkdir -p "$RUNDIR"
 	{
@@ -247,7 +247,7 @@ AID_KEYSTORE=1017
 repair_keystore_owner() {
 	local dir="$1"
 	[[ -d "$dir" ]] || return 0
-	find "$dir" -xdev ! -uid "$AID_KEYSTORE" -exec chown -h "$AID_KEYSTORE:$AID_KEYSTORE" {} +
+	find "$dir" -xdev ! -user "$AID_KEYSTORE" -exec chown -h "$AID_KEYSTORE:$AID_KEYSTORE" {} +
 }
 
 ensure_idmap() {
@@ -957,7 +957,7 @@ cmd_app() {
 # same Vulkan driver). Anything but the word "angle" in $BASE/gpu-egl means mesa. Applies at start.
 gpu_egl() {
 	local mode=""
-	[[ -f "$BASE/gpu-egl" ]] && read -r mode <"$BASE/gpu-egl" || true
+	if [[ -f "$BASE/gpu-egl" ]]; then read -r mode <"$BASE/gpu-egl" || true; fi
 	if [[ "$mode" == "angle" ]]; then echo angle; else echo mesa; fi
 }
 
@@ -994,7 +994,7 @@ xr_scale_percent() {
 
 xr_scale() {
 	local value=""
-	[[ -f "$BASE/xr-scale" ]] && read -r value <"$BASE/xr-scale" || true
+	if [[ -f "$BASE/xr-scale" ]]; then read -r value <"$BASE/xr-scale" || true; fi
 	if xr_scale_percent "$value" >/dev/null 2>&1; then echo "$value"; else echo "$XR_SCALE_DEFAULT"; fi
 }
 
@@ -1211,7 +1211,7 @@ cmd_xr() {
 # not touched by update/rollback, and anything but the word "floating" means single.
 windows_mode() {
 	local mode=""
-	[[ -f "$BASE/windows" ]] && read -r mode <"$BASE/windows" || true
+	if [[ -f "$BASE/windows" ]]; then read -r mode <"$BASE/windows" || true; fi
 	if [[ "$mode" == "floating" ]]; then echo floating; else echo single; fi
 }
 
@@ -1237,7 +1237,7 @@ shell_apk() {
 
 mode_saved() {
 	local mode=""
-	[[ -f "$BASE/mode" ]] && read -r mode <"$BASE/mode" || true
+	if [[ -f "$BASE/mode" ]]; then read -r mode <"$BASE/mode" || true; fi
 	if [[ "$mode" == "vr" ]]; then echo vr; else echo steam; fi
 }
 
@@ -1297,7 +1297,7 @@ mode_effective() {
 mode_record_start() { # ok|fail
 	local file="$RUNDIR/shell-fails" fails=0
 	mkdir -p "$RUNDIR"
-	[[ -f "$file" ]] && read -r fails <"$file" || true
+	if [[ -f "$file" ]]; then read -r fails <"$file" || true; fi
 	if [[ "$1" == "ok" ]]; then
 		rm -f "$file"
 		return 0
@@ -1930,8 +1930,9 @@ shell_launch() {
 	cmd_apps push || log "could not write the app list for the shell"
 	mkdir -p "$SHARE"
 	# The backdrop the shell draws (the Rust shell reads it at start).
-	mode_env >"$SHARE/environment.tmp" && chmod 0644 "$SHARE/environment.tmp" &&
+	if mode_env >"$SHARE/environment.tmp" && chmod 0644 "$SHARE/environment.tmp"; then
 		mv "$SHARE/environment.tmp" "$SHARE/environment" || true
+	fi
 	if [[ "$(shell_apk)" == StarforgeShell.apk ]]; then
 		# The Rust shell is always an OpenXR scene.
 		package="$STARFORGE_SHELL_PACKAGE"

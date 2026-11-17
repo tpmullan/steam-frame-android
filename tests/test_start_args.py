@@ -48,6 +48,44 @@ export -f podman 2>/dev/null || true
 """
 
 
+# Device nodes that exist on some hosts and not on others (a Mac has no /dev/full, the Frame has
+# /dev/dri): the golden files are compared without them, so a test run on any machine agrees.
+HOST_DEPENDENT_DEVICES = {
+    "/dev/dri/card0",
+    "/dev/dri/renderD128",
+    "/dev/full",
+    "/dev/fuse",
+    "/dev/shm",
+    "/dev/snd",
+    "/dev/uhid",
+    "/dev/net/tun",
+}
+
+
+def without_host_devices(args):
+    """The podman argument list minus the bind mounts of host-dependent device nodes."""
+    kept, skip = [], False
+    for index, arg in enumerate(args):
+        if skip:
+            skip = False
+            continue
+        following = args[index + 1] if index + 1 < len(args) else ""
+        if arg == "--mount" and any(
+            f"source={device},destination={device}," in following
+            for device in HOST_DEPENDENT_DEVICES
+        ):
+            skip = True
+            continue
+        kept.append(arg)
+    return kept
+
+
+def without_host_devices_spec(text):
+    spec = json.loads(text)
+    spec["devices"] = [d for d in spec.get("devices", []) if d not in HOST_DEPENDENT_DEVICES]
+    return json.dumps(spec)
+
+
 # A run with optional pieces mounted (what the XR layer and the shell app do), via the real `bind`.
 WITH_EXTRAS = r"""
 mount_xr() { bind /dev/null /vendor/lib64/extra.so ro; }
@@ -72,7 +110,7 @@ def capture_spec(headless=False, extra_env=None, extras=False):
             spec_file=captured,
             extras=extras,
         )
-        return text
+        return without_host_devices_spec(text) if text else text
 
 
 def capture(headless=False, extra_env=None, spec_file=None, extras=False):
@@ -88,7 +126,7 @@ def capture(headless=False, extra_env=None, spec_file=None, extras=False):
         server.bind(str(sock))
         out = tmp / "args.txt"
         env = {
-            "PATH": "/usr/bin:/bin",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
             "HOME": str(tmp),
             "WGAPPS_BASE": str(base),
             "XDG_RUNTIME_DIR": str(xdg),
@@ -106,7 +144,7 @@ def capture(headless=False, extra_env=None, spec_file=None, extras=False):
             return (
                 spec_file.read_text().replace(str(tmp), "<TMP>") if spec_file.exists() else ""
             ), {}
-        args = out.read_text().splitlines() if out.exists() else []
+        args = without_host_devices(out.read_text().splitlines()) if out.exists() else []
         # Paths of this run's temporary directory become names the Rust side can reproduce.
         text = json.dumps(args).replace(str(tmp), "<TMP>")
         return json.loads(text), {

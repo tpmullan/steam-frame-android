@@ -1,10 +1,12 @@
 import importlib.util
 import pathlib
+import sys
 import unittest
 
 PATH = pathlib.Path(__file__).resolve().parent.parent / "tools/decode-check.py"
 spec = importlib.util.spec_from_file_location("decode_check", PATH)
 dc = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = dc  # dataclasses (Python 3.12) look the module up by name
 spec.loader.exec_module(dc)
 
 DUMP = """

@@ -166,7 +166,7 @@ esac
         log = self.tmp / "broadcasts.log"
         env = {
             **self.env,
-            "PATH": f"{bindir}:/usr/bin:/bin",
+            "PATH": f"{bindir}:/usr/local/bin:/usr/bin:/bin",
             "FIXTURES": str(FIXTURES),
             "FAKE_LOG": str(log),
             "WGAPPS_LABEL_TRIES": "3",
@@ -209,7 +209,7 @@ esac
 
     def test_list_with_container_stopped_prints_nothing_and_exits_1(self):
         # `running` is false without podman state: bin/wgapps must refuse, not hang.
-        done = wgapps_call({**self.env, "PATH": "/usr/bin:/bin"}, "cmd_apps", "list")
+        done = wgapps_call({**self.env, "PATH": "/usr/local/bin:/usr/bin:/bin"}, "cmd_apps", "list")
         self.assertEqual(done.returncode, 1)
         self.assertEqual(done.stdout, "")
         self.assertIn("not running", done.stderr)
@@ -243,7 +243,7 @@ esac
         podman.chmod(0o755)
         env = {
             **self.env,
-            "PATH": f"{bindir}:/usr/bin:/bin",
+            "PATH": f"{bindir}:/usr/local/bin:/usr/bin:/bin",
             "FIXTURES": str(FIXTURES),
             "FAKE_LOG": str(self.tmp / "log"),
             "WGAPPS_LABEL_TRIES": "1",

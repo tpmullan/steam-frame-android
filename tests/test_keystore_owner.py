@@ -22,7 +22,11 @@ def run_repair(args, tmp):
     chown = stub / "chown"
     chown.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
     chown.chmod(0o755)
-    env = {"PATH": f"{stub}:/usr/bin:/bin", "HOME": tmp, "WGAPPS_BASE": f"{tmp}/base"}
+    env = {
+        "PATH": f"{stub}:/usr/local/bin:/usr/bin:/bin",
+        "HOME": tmp,
+        "WGAPPS_BASE": f"{tmp}/base",
+    }
     subprocess.run(["bash", str(BIN), "_repair-keystore", *args], env=env, check=True)
     return log.read_text().split() if log.exists() else []
 

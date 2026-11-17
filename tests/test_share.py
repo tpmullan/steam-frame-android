@@ -163,7 +163,7 @@ class ShareTests(unittest.TestCase):
         (tools / "setfacl").write_text('#!/bin/sh\necho "setfacl $*" >>' + str(log) + "\n")
         for tool in ("podman", "setfacl"):
             (tools / tool).chmod(0o755)
-        return {**self.env, "PATH": f"{tools}:/usr/bin:/bin"}, log
+        return {**self.env, "PATH": f"{tools}:/usr/local/bin:/usr/bin:/bin"}, log
 
     def test_each_share_gets_the_acl_entries_its_mode_needs_and_loses_them_on_remove(self):
         env, log = self.fake_tools()

@@ -58,7 +58,7 @@ class SteamLaunchTests(unittest.TestCase):
             **os.environ,
             "HOME": str(self.tmp / "home"),
             "WGAPPS_BASE": str(self.base),
-            "PATH": f"{fake}:/usr/bin:/bin",
+            "PATH": f"{fake}:/usr/local/bin:/usr/bin:/bin",
             "FAKE_DIR": str(self.tmp),
             "FAKE_LOG": str(self.log),
         }
