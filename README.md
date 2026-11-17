@@ -221,8 +221,8 @@ lock held. If the thread that would free a buffer needs that lock, the app's fra
 few seconds after leaving a fullscreen 360 video. `lib/libwgapps_egl_layer.so` is a small GLES layer that Android's
 libEGL loads (`debug.gles.layers`, from `/data/local/debug/gles`); it answers that one query with 0, which the
 extension defines as "contents undefined", and passes every other call on. `WGAPPS_EGL_LAYER=0 wgapps start`
-turns it off. Measured so far: 3 freezes in 96 exits without the layer, none in 35 with it (a run too short to
-be proof); details and the measurements are in the
+turns it off. Measured: 3 freezes in 96 exits without the layer, none in 146 with it (about a 1 in 100 chance if the
+layer did nothing: very probably fixed, from two runs on one headset); details and the measurements are in the
 [spike notes](docs/superpowers/spikes/S3-S4-S5-partial.md).
 
 ## GPU option: ANGLE

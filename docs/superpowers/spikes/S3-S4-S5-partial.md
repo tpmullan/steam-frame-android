@@ -411,3 +411,21 @@ exits is what a fix predicts, but at a 3% rate 35 clean exits also happen about 
 chance, so this is **not proof**. A run of about 150 exits would settle it (the harness now saves a native
 stack dump and the log tail, `wolvic-freeze-*.txt` in the temp directory, whenever it sees a freeze, so a
 freeze that survives the layer can be read). `WGAPPS_EGL_LAYER=0` turns the layer off for a comparison.
+
+### Result of the 150-exit run with the layer (2026-11-17)
+
+Hardware decoder + `libwgapps_egl_layer.so`, the same stressed scripted rounds: 149 fresh Wolvic launches,
+fullscreen entered 111 times (29 launches missed the click, a failure of the aim, not of the browser; 1 round
+discarded because the headset moved), **0 freezes**, longest gap in Wolvic's frame logs 1.0 s. With the 35
+exits of the first, shorter run that is 146 exits with none, against 3 in 96 without the layer.
+If the layer did nothing and the freeze rate were the 3% seen without it, 146 clean exits would happen about
+1 time in 100, so the layer very probably removes the freeze; it is still a measured result of two runs on
+one headset, not a proof.
+
+One new native crash appeared in that run and is a different bug: at 05:40, Wolvic's `NDK MediaCodec_` thread
+died with SIGSEGV (fault address 0x4) in `android::RefBase::incStrong` called from
+`defaultServiceManager1_2` inside `Codec2Client::CreateFromService` (`CCodec::allocate`): the HIDL service
+manager lookup returned a null pointer while a video codec was being created. It happened once in about 150
+launches and Android restarted at the end of the run, so the log around it is gone and I cannot say whether
+the hardware decoder service (which adds an entry to `hwservicemanager`) played a part. If it shows up again,
+the tombstone's `Cmdline`, the `hwservicemanager` state and `logcat -b crash` at that moment are what is needed.
