@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Keep the folders shared with Android usable from both sides.
+
+Android's apps create files as their own user IDs (sub-IDs of yours) with mode 0600, which you
+cannot read. This helper looks at each read-write shared folder (~/Android-share every few seconds,
+the ones added with `wgapps share add --rw` less often) and gives such files to you, group
+media_rw, user and group read-write: Android keeps its access through the group. Files that are
+already yours are never touched.
+
+It runs `podman unshare find ...`: inside that user namespace "uid 0" is you, so a file owned by
+any other mapped ID is one Android made.
+
+Usage: wgapps-share
+Environment: WGAPPS_BASE (default ~/.local/share/waydroid-gapps)
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+DEFAULT_NAME = "Host"
+MEDIA_RW = "1023"  # Android's media_rw group, as the container sees it
+FAST = 5  # seconds between looks at the built-in folder
+SLOW = 60  # ... and at folders the user added
+
+
+def log(msg: str) -> None:
+    print(time.strftime("%F %T"), "wgapps-share:", msg, file=sys.stderr, flush=True)
+
+
+def rw_shares(base: pathlib.Path, home: pathlib.Path) -> list[tuple[pathlib.Path, bool]]:
+    """(folder, is the built-in one) for every read-write shared folder that exists."""
+    found = [(home / "Android-share", True)]
+    conf = base / "shares.conf"
+    try:
+        lines = conf.read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) == 3 and parts[2] == "rw" and parts[0] != DEFAULT_NAME:
+            found.append((pathlib.Path(parts[1]), False))
+    return [(path, builtin) for path, builtin in found if path.is_dir()]
+
+
+def fix_command(folder: pathlib.Path) -> list[str]:
+    """Take over what Android made under `folder` (not owned by uid 0 of the user namespace)"""
+    return [
+        *("nice", "-n", "19"),
+        *("podman", "unshare", "find", str(folder), "-xdev", "!", "-user", "0"),
+        *("(", "-type", "f", "-o", "-type", "d", ")"),
+        *("-exec", "chown", f"0:{MEDIA_RW}", "{}", "+"),
+        *("-exec", "chmod", "ug+rwX", "{}", "+"),
+    ]
+
+
+def due(last: dict, folder: pathlib.Path, builtin: bool, now: float) -> bool:
+    return now - last.get(folder, 0.0) >= (FAST if builtin else SLOW)
+
+
+def run_once(base: pathlib.Path, home: pathlib.Path, last: dict, now: float, run) -> list[str]:
+    """Fix the folders that are due; returns the folders it ran for."""
+    ran = []
+    for folder, builtin in rw_shares(base, home):
+        if due(last, folder, builtin, now):
+            last[folder] = now
+            run(fix_command(folder))
+            ran.append(str(folder))
+    return ran
+
+
+def main() -> int:
+    base = pathlib.Path(
+        os.environ.get("WGAPPS_BASE", pathlib.Path.home() / ".local/share/waydroid-gapps")
+    )
+    home = pathlib.Path.home()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    def run(command: list[str]) -> None:
+        try:
+            subprocess.run(command, check=False, timeout=300, capture_output=True)
+        except (OSError, subprocess.SubprocessError) as error:
+            log(f"{command[3]}: {error}")
+
+    last: dict = {}
+    try:
+        while True:
+            run_once(base, home, last, time.monotonic(), run)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

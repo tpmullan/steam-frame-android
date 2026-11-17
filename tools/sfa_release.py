@@ -41,6 +41,7 @@ REQUIRED_FILES = (
     "wgapps/bin/wgapps-battery",
     "wgapps/bin/wgapps-clipboard",
     "wgapps/bin/wgapps-profiles",
+    "wgapps/bin/wgapps-share",
     "wgapps/bin/wgapps-appwatch",
     "wgapps/bin/wgapps-ota",
     "wgapps/bin/wgapps-gen-overrides",

@@ -35,6 +35,7 @@ mount_app_props() { :; }
 mount_composer_egl() { :; }
 mount_settings_app() { :; }
 mount_shell_app() { :; }
+mount_shares() { :; }
 start_helpers() { :; }
 write_seccomp() { echo "$RUNDIR/android.seccomp.json"; }
 awk() { echo 192.0.2.53; }

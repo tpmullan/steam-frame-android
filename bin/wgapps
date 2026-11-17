@@ -77,6 +77,10 @@ usage: wgapps <command> [args]
   apps sync            make the Steam library match: one entry per app, gone apps removed
   apps kind <package> xr|2d|auto
                        treat an app as OpenXR or flat whatever detection says
+  share [add <path> [name] [--rw]|remove <name>]
+                       folders from this computer inside Android's storage (the Files app):
+                       ~/Android-share is always there as "Host" (read-write); added folders,
+                       any directory including your home, are read-only unless --rw (restart Android)
   windows [floating|single]
                        show or set how apps open: floating = movable windows inside
                        Android's one panel, single = each app fills it (restart Android)
@@ -994,6 +998,196 @@ xr_scale() {
 	if xr_scale_percent "$value" >/dev/null 2>&1; then echo "$value"; else echo "$XR_SCALE_DEFAULT"; fi
 }
 
+# --- shared folders ---------------------------------------------------------
+# Folders of this computer inside Android's own storage, where the Files app lists them. ~/Android-share is
+# always shared, read-write, as "Host". `wgapps share add` adds others (any directory, your home included),
+# read-only unless asked otherwise; each is recorded in $BASE/shares.conf as "name<TAB>path<TAB>ro|rw" and
+# mounted at /data/media/0/<name> when Android starts.
+SHARES_CONF="$BASE/shares.conf"
+SHARE_DEFAULT_NAME=Host
+SHARE_DEFAULT_DIR="$HOME/Android-share"
+# Names Android's storage already uses (a mount there would hide the real folder).
+SHARE_RESERVED=(Android Alarms Audiobooks DCIM Documents Download Movies Music Notifications Pictures Podcasts
+	Recordings Ringtones)
+
+share_valid_name() {
+	local reserved lower
+	[[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]] || return 1
+	lower="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+	for reserved in "${SHARE_RESERVED[@]}"; do
+		[[ "$lower" == "$(printf '%s' "$reserved" | tr '[:upper:]' '[:lower:]')" ]] && return 1
+	done
+	return 0
+}
+
+# A directory that may be shared: absolute, no characters that would break the mount option, not / and not
+# wgapps' own data ($BASE and below: Android's file system and its apps' data). Your home may be shared:
+# Android's apps run as other user IDs, so they see only what is readable by others.
+share_valid_path() {
+	[[ "$1" == /* && -d "$1" && "$1" != *[,:\\$'\n']* ]] || return 1
+	local real base
+	real="$(cd "$1" && pwd -P)" || return 1
+	base="$(cd "$BASE" 2>/dev/null && pwd -P)" || base="$BASE"
+	[[ "$real" == / || "$real" == "$base" || "$real" == "$base"/* ]] && return 1
+	return 0
+}
+
+share_has() { # name
+	[[ -f "$SHARES_CONF" ]] && awk -F'\t' -v n="$1" '$1 == n { found = 1 } END { exit !found }' "$SHARES_CONF"
+}
+
+# name<TAB>path<TAB>mode, the default folder first.
+shares_list() {
+	local name path mode
+	printf '%s\t%s\trw\n' "$SHARE_DEFAULT_NAME" "$SHARE_DEFAULT_DIR"
+	[[ -f "$SHARES_CONF" ]] || return 0
+	while IFS=$'\t' read -r name path mode || [[ -n "$name" ]]; do
+		if [[ "$name" != "$SHARE_DEFAULT_NAME" && ("$mode" == ro || "$mode" == rw) ]] &&
+			share_valid_name "$name" && [[ -d "$path" ]]; then
+			printf '%s\t%s\t%s\n' "$name" "$path" "$mode"
+		fi
+	done <"$SHARES_CONF"
+}
+
+# Android's apps reach a shared folder as group media_rw (gid 1023 inside the container, a sub-GID here).
+share_group_id() {
+	local probe gid=""
+	command -v podman >/dev/null || return 1
+	probe="$(mktemp "$BASE/.share-gid.XXXXXX")" || return 1
+	# shellcheck disable=SC2012 # stat's format option differs between GNU and BSD; ls -n is the same everywhere
+	if podman unshare chgrp 1023 "$probe" 2>/dev/null; then gid="$(ls -ldn "$probe" | awk '{ print $4 }')"; fi
+	rm -f "$probe"
+	[[ "$gid" =~ ^[0-9]+$ ]] && echo "$gid"
+}
+
+# Android's apps are other users than you, so a folder is open to them only as far as its permissions say
+# (your home directory is mode 0700: closed). Sharing a folder therefore adds the media_rw group to the
+# folder's own ACL, and nothing else: read and list for a read-only share; read, write and the same for what
+# is created in it later for a read-write one. The built-in folder also belongs to the group (setgid), so
+# what Android makes there stays shared; a folder you added keeps its owner and mode. Android still sees
+# only what other users may read below the top level (a mode 0700 folder stays closed). `share remove`
+# takes the entries away again.
+share_prepare() { # folder builtin|added ro|rw
+	local dir="$1" gid
+	gid="$(share_group_id)" || return 0
+	command -v setfacl >/dev/null || return 0
+	if [[ "$3" == rw ]]; then
+		if [[ "$2" == builtin ]]; then
+			podman unshare chgrp 1023 "$dir" 2>/dev/null || true
+			chmod 2775 "$dir" 2>/dev/null || true
+		fi
+		setfacl -m "g:$gid:rwx" -d -m "g:$gid:rwx" "$dir" 2>/dev/null || true
+	else
+		setfacl -m "g:$gid:rx" "$dir" 2>/dev/null || true
+	fi
+}
+
+share_unprepare() { # folder
+	local dir="$1" gid
+	gid="$(share_group_id)" || return 0
+	command -v setfacl >/dev/null || return 0
+	setfacl -x "g:$gid" "$dir" 2>/dev/null || true
+	setfacl -d -x "g:$gid" "$dir" 2>/dev/null || true
+}
+
+# Android reaches /storage/emulated (the Files app) through a FUSE layer that reads /mnt/pass_through, a
+# copy of /data/media that vold makes late in boot (after boot_completed, so a bind made earlier would be
+# covered) and that does not contain our mounts. So a small service waits for that mount and then binds
+# each folder into it.
+shares_script() {
+	local name path mode
+	cat <<'EOF'
+#!/system/bin/sh
+# wgapps: bind each shared folder where Android's FUSE storage layer reads it.
+n=0
+while ! grep -q ' /mnt/pass_through/0/emulated ' /proc/mounts; do
+    n=$((n + 1))
+    [ "$n" -gt 600 ] && exit 1
+    sleep 1
+done
+bind_share() {
+    grep -q " /mnt/pass_through/0/emulated/0/$1 " /proc/mounts ||
+        mount -o bind "/data/media/0/$1" "/mnt/pass_through/0/emulated/0/$1"
+}
+EOF
+	while IFS=$'\t' read -r name path mode; do
+		printf 'bind_share %s\n' "$name"
+	done < <(shares_list)
+}
+
+shares_init_rc() {
+	cat <<'EOF'
+service wgapps-shares /system/bin/sh /vendor/bin/wgapps-shares.sh
+    user root
+    group root
+    disabled
+    oneshot
+
+on property:sys.boot_completed=1
+    start wgapps-shares
+EOF
+}
+
+mount_shares() {
+	local name path mode
+	mkdir -p "$SHARE_DEFAULT_DIR" "$RUNDIR"
+	while IFS=$'\t' read -r name path mode; do
+		bind "$path" "/data/media/0/$name" "$mode"
+		share_prepare "$path" "$([[ "$name" == "$SHARE_DEFAULT_NAME" ]] && echo builtin || echo added)" "$mode"
+	done < <(shares_list)
+	shares_init_rc >"$RUNDIR/wgapps-shares.rc"
+	shares_script >"$RUNDIR/wgapps-shares.sh"
+	chmod 0644 "$RUNDIR/wgapps-shares.rc" "$RUNDIR/wgapps-shares.sh"
+	bind "$RUNDIR/wgapps-shares.rc" /vendor/etc/init/wgapps-shares.rc ro
+	bind "$RUNDIR/wgapps-shares.sh" /vendor/bin/wgapps-shares.sh ro
+}
+
+cmd_share() {
+	local action="${1:-}" path name mode=ro arg
+	shift || true
+	case "$action" in
+	"")
+		while IFS=$'\t' read -r name path mode; do
+			printf '%s\t%s\t%s\n' "$name" "$path" "$mode"
+		done < <(shares_list)
+		;;
+	add)
+		local args=()
+		for arg in "$@"; do
+			if [[ "$arg" == --rw ]]; then mode=rw; else args+=("$arg"); fi
+		done
+		[[ ${#args[@]} -ge 1 && ${#args[@]} -le 2 ]] || die "usage: wgapps share add <path> [name] [--rw]"
+		path="${args[0]}"
+		[[ "$path" == /* ]] || path="$PWD/$path"
+		path="$(cd "$path" 2>/dev/null && pwd -P)" || die "not a directory: ${args[0]}"
+		share_valid_path "$path" || die "cannot share $path (it must be a plain directory, not wgapps' own data)"
+		name="${args[1]:-$(basename "$path")}"
+		name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '-' | sed 's/^[^A-Za-z0-9]*//')"
+		[[ -n "$name" ]] || name=Folder
+		share_valid_name "$name" || die "'$name' cannot be a folder name in Android's storage (letters, digits . _ - ; not one Android already uses)"
+		[[ "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$SHARE_DEFAULT_NAME" | tr '[:upper:]' '[:lower:]')" ]] &&
+			die "'$name' is the built-in folder (~/Android-share)"
+		mkdir -p "$BASE"
+		{
+			if [[ -f "$SHARES_CONF" ]]; then awk -F'\t' -v n="$name" '$1 != n' "$SHARES_CONF"; fi
+			printf '%s\t%s\t%s\n' "$name" "$path" "$mode"
+		} >"$SHARES_CONF.new"
+		mv "$SHARES_CONF.new" "$SHARES_CONF"
+		log "$path shared as '$name' ($mode)$(running && echo "; restart Android for it to apply")"
+		;;
+	remove)
+		[[ $# -eq 1 ]] || die "usage: wgapps share remove <name>"
+		[[ "$1" != "$SHARE_DEFAULT_NAME" ]] || die "'$1' is the built-in folder (~/Android-share); it is always shared"
+		share_has "$1" || die "no shared folder named '$1'"
+		share_unprepare "$(awk -F'\t' -v n="$1" '$1 == n { print $2 }' "$SHARES_CONF")"
+		awk -F'\t' -v n="$1" '$1 != n' "$SHARES_CONF" >"$SHARES_CONF.new"
+		mv "$SHARES_CONF.new" "$SHARES_CONF"
+		log "'$1' removed$(running && echo "; restart Android for it to apply")"
+		;;
+	*) die "usage: wgapps share [add <path> [name] [--rw]|remove <name>]" ;;
+	esac
+}
+
 cmd_xr() {
 	local value="${2:-}"
 	[[ "${1:-}" == "scale" && $# -le 2 ]] || die "usage: wgapps xr scale [1.0-2.0|default]"
@@ -1428,10 +1622,16 @@ write_run_spec() {
 			"$(json_str "$NAME")" "$(json_str "$DATA")" "$(json_str "$SHARE")" "$(json_str "$RUNDIR")" \
 			"$(json_str "$ROOTFS")" "$(json_str "$RUNDIR/android.seccomp.json")"
 		list="" sep=""
-		for item in ${mounts[@]+"${mounts[@]}"}; do list+="$sep$(json_str "$item")"; sep=","; done
+		for item in ${mounts[@]+"${mounts[@]}"}; do
+			list+="$sep$(json_str "$item")"
+			sep=","
+		done
 		printf '"extra_mounts":[%s],' "$list"
 		list="" sep=""
-		for item in ${devs[@]+"${devs[@]}"}; do list+="$sep$(json_str "$item")"; sep=","; done
+		for item in ${devs[@]+"${devs[@]}"}; do
+			list+="$sep$(json_str "$item")"
+			sep=","
+		done
 		printf '"devices":[%s],' "$list"
 		printf '"char_dev":%s,' "$([[ -e /dev/char ]] && echo true || echo false)"
 		if [[ -e "$XDG/pulse/native" ]]; then
@@ -1530,6 +1730,7 @@ cmd_start() {
 	mount_composer_egl
 	mount_settings_app
 	mount_shell_app
+	mount_shares
 	local extra_mounts=("${ARGS[@]:extras_from}") devices_present=()
 	local dev devices=(/dev/dri/card0 /dev/dri/renderD128 /dev/zero /dev/null /dev/full
 		/dev/fuse /dev/tty /dev/shm /dev/snd /dev/uhid /dev/net/tun /dev/random
@@ -1593,6 +1794,7 @@ start_helpers() {
 	start_helper wgapps-battery
 	start_helper wgapps-clipboard
 	WGAPPS_BASE="$BASE" WGAPPS_SHARE="$SHARE" WGAPPS_BIN="$BIN" start_helper wgapps-profiles
+	WGAPPS_BASE="$BASE" start_helper wgapps-share
 	# Taps from the VR shell onto a 2D app's panel; only in vr mode.
 	if [[ "$(mode_effective)" == "vr" ]]; then
 		WGAPPS_BASE="$BASE" WGAPPS_SHARE="$SHARE" start_helper wgapps-panelinput
@@ -1611,7 +1813,7 @@ start_helper() {
 
 stop_helpers() {
 	local name pid
-	for name in wgapps-pad wgapps-battery wgapps-clipboard wgapps-profiles wgapps-panelinput wgapps-bridge; do
+	for name in wgapps-pad wgapps-battery wgapps-clipboard wgapps-profiles wgapps-share wgapps-panelinput wgapps-bridge; do
 		pid="$(cat "$RUNDIR/$name.pid" 2>/dev/null || true)"
 		if [[ -n "$pid" ]] && grep -q "$name" "/proc/$pid/cmdline" 2>/dev/null; then
 			kill "$pid" 2>/dev/null || true
@@ -2073,6 +2275,7 @@ main() {
 	windows) cmd_windows "$@" ;;
 	gpu) cmd_gpu "$@" ;;
 	xr) cmd_xr "$@" ;;
+	share) cmd_share "$@" ;;
 	mode) cmd_mode "$@" ;;
 	view) cmd_view "$@" ;;
 	report) cmd_report "$@" ;;

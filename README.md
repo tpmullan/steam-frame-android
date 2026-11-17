@@ -184,6 +184,36 @@ layer in `xr-layer/` multiplies the recommendation by `wgapps xr scale` (default
 2160x2160). `wgapps xr scale 1.0` turns it off, `wgapps xr scale default` restores 1.25, and a change applies
 the next time Android starts. It costs about 56% more pixels; heavy scenes may need a lower value.
 
+## Your files in Android's Files app
+
+Android's own storage is private to the container, so nothing from the Frame was visible in the Files app.
+`wgapps share` puts folders of the Frame inside it:
+
+- `~/Android-share` is always shared, read-write, as the folder **Host** (created at the first start). Drop
+  files there on the Frame or in Android's Files app and both sides can use them.
+- `wgapps share add <path> [name] [--rw]` shares any other directory, your whole home directory included
+  (`wgapps share add ~ Home`), read-only unless you say `--rw`. `wgapps share` lists them and
+  `wgapps share remove <name>` stops sharing one (the folder itself is never touched). A change applies the
+  next time Android starts.
+
+What Android can see and do:
+
+- Android's apps are other users than you. Sharing a folder adds Android's storage group to that one
+  directory's ACL (list and read for read-only, plus write for read-write) and nothing else, and removing the
+  share takes it away. Below the top level the folder's own permissions apply: your home directory is
+  mode 0700, so it works only because of that ACL entry, and then Android sees what other users may
+  read (a mode 0700 folder such as `~/.ssh` stays closed, a world-readable file does not). Think of
+  sharing your home as handing every Android app, Google's included, every world-readable file in it.
+- Files Android creates in a read-write folder belong to Android's own user, which you cannot read; the
+  `wgapps-share` helper hands them to you (group read-write, so Android keeps its access) a few seconds later
+  (about a minute for folders you added). Files you create there get the same access through the ACL.
+- New files and folders show up on the other side at once. A file that already exists and is changed on the
+  Frame can keep showing its old content in Android (Android's storage layer caches it; it did for
+  over two minutes in testing), and an Android app that appends to it then overwrites your change. Replace
+  files rather than editing them in place, and do not edit the same file on both sides at once.
+- `/`, wgapps' own data and names Android's storage already uses (Download, DCIM, Music and so on) cannot
+  be shared.
+
 ## Freeze after leaving fullscreen video
 
 Mesa's Android EGL answers `eglQuerySurface(EGL_BUFFER_AGE_EXT)` by dequeuing the next back buffer with the display
