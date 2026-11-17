@@ -217,8 +217,10 @@ What Android can see and do:
   reverse. Files then stay owned by you on disk, whoever made them, and the ACLs and the `wgapps-share` helper
   are no longer used for those folders. `wgapps share idmap-status` shows which method each folder uses,
   `idmap-remove` undoes it, and after `wgapps share add` run `idmap-setup` again to include the new folder.
-  The mapping and the write direction were checked on a real Linux 7.0 kernel; this has not yet been run on
-  a Frame, so treat it as experimental (needs Linux 5.12 or newer and ext4, xfs or btrfs under the folder).
+  Checked on a real Linux 7.0 kernel with this helper and real rootless podman: a file you own shows inside the
+  container as owned by Android's storage user, and what that user writes lands on disk owned by you. Not yet
+  run on a Frame (the systemd unit and Android's own storage layer on top of the mount), so treat it as
+  experimental (needs Linux 5.12 or newer and ext4, xfs or btrfs under the folder).
 - `/`, wgapps' own data and names Android's storage already uses (Download, DCIM, Music and so on) cannot
   be shared.
 
