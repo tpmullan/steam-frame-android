@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""The Linux end of the VR shell's bridge (protocol v1, see starforge-bridge in the engine repo).
+
+Listens on a unix socket in the folder shared with Android (bridge.sock, mode 0666 so the shell's
+uid can connect). One JSON object per line each way:
+
+  shell -> here: {"type":"hello","version":1}, {"type":"catalog"}, {"type":"launch","id":"steam:<appid>"}
+  here -> shell: {"type":"hello","version":1}, {"type":"apps","apps":[{id,label,kind:"linux"}]},
+                 {"type":"launched","id":...,"ok":bool}, {"type":"error","message":...}
+
+The catalog is the installed Steam games (appmanifest_*.acf, minus Proton, runtimes and
+redistributables); launching runs `steam steam://rungameid/<appid>` for an installed game only.
+Unknown messages are ignored; a flood of bad lines is cut off.
+
+Usage: wgapps-bridge
+Environment: WGAPPS_BASE (default ~/.local/share/waydroid-gapps), WGAPPS_SHARE (default
+$WGAPPS_BASE/share), WGAPPS_STEAMAPPS (default ~/.local/share/Steam/steamapps)
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import pathlib
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = 1
+MAX_LINE = 64 * 1024
+MAX_LABEL = 100
+MAX_ERRORS = 5  # per connection; after that bad lines are dropped silently
+MAX_ICON = 40 * 1024  # raw bytes of one icon (the Rust side refuses more)
+HIDDEN = re.compile(r"^(Proton\b|Steam Linux Runtime|Steamworks Common|Steam Controller Configs)")
+# A VDF line: "key"  "value"; quotes inside a value are written \" and backslashes \\.
+KV = re.compile(r'^\s*"(?P<key>[^"]+)"\s+"(?P<value>(?:[^"\\]|\\.)*)"\s*$')
+
+
+def log(msg: str) -> None:
+    print(time.strftime("%F %T"), "wgapps-bridge:", msg, file=sys.stderr, flush=True)
+
+
+def parse_acf(text: str) -> tuple[str, str] | None:
+    """(appid, name) of an appmanifest, or None when either is missing or odd."""
+    appid = name = None
+    for line in text.splitlines():
+        match = KV.match(line)
+        if not match:
+            continue
+        value = re.sub(r"\\(.)", r"\1", match["value"])
+        if match["key"] == "appid":
+            appid = value
+        elif match["key"] == "name":
+            name = value
+    if not appid or not appid.isdigit() or len(appid) > 12 or not name:
+        return None
+    return appid, name[:MAX_LABEL]
+
+
+def installed_games(steamapps: pathlib.Path) -> dict[str, str]:
+    games: dict[str, str] = {}
+    try:
+        manifests = sorted(steamapps.glob("appmanifest_*.acf"))
+    except OSError:
+        return games
+    for manifest in manifests:
+        try:
+            parsed = parse_acf(manifest.read_text(errors="replace"))
+        except OSError:
+            continue
+        if parsed and not HIDDEN.match(parsed[1]):
+            games[parsed[0]] = parsed[1]
+    return games
+
+
+# A Linux display watched as a panel: raw RGBA frames at this size over stream.sock.
+STREAM_W = 1280
+STREAM_H = 720
+X11_DIR = pathlib.Path("/tmp/.X11-unix")
+DISPLAY = re.compile(r":[0-9]{1,2}")
+
+
+GRABBER = pathlib.Path(__file__).resolve().with_name("wgapps-gamescope-grab")
+
+
+def valid_display(display: object) -> bool:
+    return isinstance(display, str) and DISPLAY.fullmatch(display) is not None
+
+
+def valid_source(source: object) -> bool:
+    """What a client may ask to watch: an X display (':0') or what gamescope shows ('gamescope')."""
+    return source == "gamescope" or valid_display(source)
+
+
+def x_displays(directory: pathlib.Path = X11_DIR) -> list[str]:
+    """The X displays on this machine (gamescope's, SteamOS's), as ':N', from their sockets."""
+    try:
+        names = sorted(p.name for p in directory.iterdir())
+    except OSError:
+        return []
+    found = [f":{n[1:]}" for n in names if re.fullmatch(r"X[0-9]{1,2}", n)]
+    return sorted(found, key=lambda d: int(d[1:]))
+
+
+def grab_command(display: str, fps: int) -> list[str]:
+    if display == "gamescope":
+        # gamescope's PipeWire video node, read by our own client (scales to the panel itself).
+        return [str(GRABBER), "--fps", str(fps), "--width", str(STREAM_W), "--height", str(STREAM_H)]
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "x11grab", "-framerate", str(fps), "-i", display,
+        "-vf", f"scale={STREAM_W}:{STREAM_H},format=rgba",
+        "-f", "rawvideo", "-",
+    ]  # fmt: skip
+
+
+def frame_header() -> bytes:
+    return struct.pack("<II", STREAM_W, STREAM_H)
+
+
+ICON_FILE = re.compile(r"[0-9a-f]{40}\.(jpg|png)")
+
+
+def game_icon(librarycache: pathlib.Path, appid: str) -> tuple[str, bytes] | None:
+    """The small icon Steam caches for a game: the 40-hex-digit-named image in the top of its
+    folder. (format, bytes), or None when there is none or it is too big."""
+    try:
+        for entry in sorted((librarycache / appid).iterdir()):
+            match = ICON_FILE.fullmatch(entry.name)
+            if match and entry.is_file() and entry.stat().st_size <= MAX_ICON:
+                return match[1], entry.read_bytes()
+    except OSError:
+        pass
+    return None
+
+
+def default_librarycache(steamapps: pathlib.Path) -> pathlib.Path:
+    """Steam's library cache sits beside `steamapps`, in `appcache/librarycache`."""
+    return steamapps.parent / "appcache" / "librarycache"
+
+
+def message(**fields) -> bytes:
+    return (json.dumps(fields, separators=(",", ":")) + "\n").encode()
+
+
+class Session:
+    """One connection's state: turns a line into reply lines."""
+
+    def __init__(
+        self,
+        steamapps: pathlib.Path,
+        launcher,
+        librarycache: pathlib.Path | None = None,
+        x11_dir: pathlib.Path = X11_DIR,
+        grabber: pathlib.Path = GRABBER,
+    ):
+        self.steamapps = steamapps
+        self.launcher = launcher
+        self.librarycache = librarycache
+        self.x11_dir = x11_dir
+        self.grabber = grabber
+        self.errors = 0
+
+    def _error(self, text: str) -> list[bytes]:
+        self.errors += 1
+        return [message(type="error", message=text)] if self.errors <= MAX_ERRORS else []
+
+    def handle(self, line: str) -> list[bytes]:
+        line = line.strip()
+        if not line:
+            return []
+        try:
+            request = json.loads(line)
+        except ValueError:
+            return self._error("not JSON")
+        if not isinstance(request, dict) or not isinstance(request.get("type"), str):
+            return self._error("not a message")
+        kind = request["type"]
+        if kind == "hello":
+            return [message(type="hello", version=VERSION)]
+        if kind == "catalog":
+            games = installed_games(self.steamapps)
+            apps = [
+                {"id": f"steam:{appid}", "label": name, "kind": "linux"}
+                for appid, name in sorted(games.items(), key=lambda kv: kv[1].lower())
+            ]
+            if self.grabber.exists():
+                apps.append({"id": "screen:0", "label": "Screen (gamescope)", "kind": "linux"})
+            apps += [
+                {"id": f"x11:{d[1:]}", "label": f"Display {d}", "kind": "linux"}
+                for d in x_displays(self.x11_dir)
+            ]
+            return [message(type="apps", apps=apps)]
+        if kind == "launch":
+            ident = request.get("id")
+            if not isinstance(ident, str):
+                return self._error("launch needs an id")
+            match = re.fullmatch(r"steam:([0-9]{1,12})", ident)
+            ok = bool(match) and match[1] in installed_games(self.steamapps)
+            if ok:
+                self.launcher(["steam", f"steam://rungameid/{match[1]}"])
+            return [message(type="launched", id=ident[:64], ok=ok)]
+        if kind == "icon":
+            ident = request.get("id")
+            if not isinstance(ident, str):
+                return self._error("icon needs an id")
+            match = re.fullmatch(r"steam:([0-9]{1,12})", ident)
+            found = None
+            if match and self.librarycache and match[1] in installed_games(self.steamapps):
+                found = game_icon(self.librarycache, match[1])
+            fmt, raw = found if found else ("", b"")
+            return [
+                message(
+                    type="icondata",
+                    id=ident[:64],
+                    format=fmt,
+                    data=base64.b64encode(raw).decode(),
+                )
+            ]
+        return []  # a type this version does not know: ignored
+
+
+class LineReader:
+    """Splits a byte stream into lines; a line past MAX_LINE is dropped whole."""
+
+    def __init__(self):
+        self.pending = bytearray()
+        self.skipping = False
+
+    def feed(self, data: bytes) -> list[str]:
+        lines = []
+        for byte in data:
+            if byte == 0x0A:
+                if self.skipping:
+                    self.skipping = False
+                elif self.pending:
+                    lines.append(self.pending.decode("utf-8", errors="replace"))
+                self.pending.clear()
+            elif self.skipping:
+                continue
+            elif len(self.pending) >= MAX_LINE:
+                self.pending.clear()
+                self.skipping = True
+            else:
+                self.pending.append(byte)
+        return lines
+
+
+class Server:
+    def __init__(self, listener: socket.socket, steamapps: pathlib.Path, launcher, librarycache=None):
+        self.listener = listener
+        self.steamapps = steamapps
+        self.launcher = launcher
+        self.librarycache = librarycache
+
+    def close(self) -> None:
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+
+    def run(self) -> None:
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._client, args=(connection,), daemon=True).start()
+
+    def _client(self, connection: socket.socket) -> None:
+        session = Session(self.steamapps, self.launcher, self.librarycache)
+        reader = LineReader()
+        connection.settimeout(300)
+        try:
+            while True:
+                data = connection.recv(4096)
+                if not data:
+                    return
+                for line in reader.feed(data):
+                    for reply in session.handle(line):
+                        connection.sendall(reply)
+        except OSError:
+            return
+        finally:
+            connection.close()
+
+
+def serve(path: pathlib.Path, steamapps: pathlib.Path, launcher, librarycache=None) -> Server:
+    path.unlink(missing_ok=True)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(path))
+    os.chmod(path, 0o666)  # Android's uid for the shell must be able to connect
+    listener.listen(4)
+    return Server(listener, steamapps, launcher, librarycache)
+
+
+class StreamServer:
+    """Streams raw RGBA frames of an X display to whoever asks on stream.sock.
+
+    The client sends one line, {"display":":0","fps":5}; then it receives, per frame, an 8-byte
+    header (width, height as little-endian u32) and width*height*4 bytes. Leaving ends the grab."""
+
+    def __init__(self, listener: socket.socket, grab):
+        self.listener = listener
+        self.grab = grab
+        self.processes: set[subprocess.Popen] = set()
+        self.lock = threading.Lock()
+
+    def close(self) -> None:
+        """Stop listening and end every grab that is running (they must not outlive the daemon)."""
+        try:
+            self.listener.close()
+        except OSError:
+            pass
+        with self.lock:
+            running = list(self.processes)
+        for process in running:
+            process.kill()
+
+    def run(self) -> None:
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._client, args=(connection,), daemon=True).start()
+
+    def _client(self, connection: socket.socket) -> None:
+        process = None
+        try:
+            connection.settimeout(10)
+            request = bytearray()
+            while b"\n" not in request and len(request) < 1024:
+                chunk = connection.recv(256)
+                if not chunk:
+                    return
+                request += chunk
+            try:
+                wanted = json.loads(bytes(request).split(b"\n")[0])
+                display, fps = wanted["display"], int(wanted.get("fps", 5))
+            except (ValueError, KeyError, TypeError):
+                return
+            if not valid_source(display) or not 1 <= fps <= 15:
+                return
+            connection.settimeout(None)
+            size = STREAM_W * STREAM_H * 4
+            process = subprocess.Popen(
+                self.grab(display, fps), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=size
+            )
+            with self.lock:
+                self.processes.add(process)
+            header = frame_header()
+            while True:
+                frame = process.stdout.read(size)
+                if len(frame) < size:
+                    return
+                connection.sendall(header + frame)
+        except OSError:
+            return
+        finally:
+            if process is not None:
+                process.kill()
+                process.wait()
+                with self.lock:
+                    self.processes.discard(process)
+            connection.close()
+
+
+def serve_stream(path: pathlib.Path, grab=grab_command) -> StreamServer:
+    path.unlink(missing_ok=True)
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(path))
+    os.chmod(path, 0o666)
+    listener.listen(4)
+    return StreamServer(listener, grab)
+
+
+def _spawn(argv: list[str]) -> None:
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def main() -> int:
+    base = pathlib.Path(os.environ.get("WGAPPS_BASE", "~/.local/share/waydroid-gapps")).expanduser()
+    share = pathlib.Path(os.environ.get("WGAPPS_SHARE", str(base / "share")))
+    steamapps = pathlib.Path(
+        os.environ.get("WGAPPS_STEAMAPPS", "~/.local/share/Steam/steamapps")
+    ).expanduser()
+    librarycache = pathlib.Path(
+        os.environ.get("WGAPPS_LIBRARYCACHE", str(default_librarycache(steamapps)))
+    )
+    server = serve(share / "bridge.sock", steamapps, _spawn, librarycache)
+    streams = serve_stream(share / "stream.sock")
+    threading.Thread(target=streams.run, daemon=True).start()
+
+    def stop(*_):
+        server.close()
+        streams.close()
+
+    signal.signal(signal.SIGTERM, stop)
+    log(f"listening on {share / 'bridge.sock'} and {share / 'stream.sock'}")
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

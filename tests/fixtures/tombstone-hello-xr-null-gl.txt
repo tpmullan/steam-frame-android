@@ -1,0 +1,7 @@
+Timestamp: 2026-11-14 12:39:36.000000000-0800
+Cmdline: org.khronos.openxr.hello_xr.opengles
+signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0000000000000000
+backtrace:
+      #00 pc 0000000000000000  <unknown>
+      #01 pc 0000000000098c08  /data/app/x/org.khronos.openxr.hello_xr.opengles-y/base.apk (offset 0x1000)
+      #03 pc 00000000000a5050  /data/app/x/org.khronos.openxr.hello_xr.opengles-y/base.apk (offset 0x1000) (android_main+1272)

@@ -1,0 +1,27 @@
+--- a/components/V4L2DecodeInterface.cpp
++++ b/components/V4L2DecodeInterface.cpp
+@@ -10,6 +10,7 @@
+ #include <C2PlatformSupport.h>
+ #include <SimpleC2Interface.h>
+ #include <android/hardware/graphics/common/1.0/types.h>
++#include <cutils/properties.h>
+ #include <log/log.h>
+ #include <media/stagefright/foundation/MediaDefs.h>
+ 
+@@ -45,9 +46,14 @@
+               area, k4KArea);
+     }
+ 
++    // Some decoders require bitstream buffers larger than these estimates whatever the stream
++    // (Qualcomm's iris: 17694720 bytes), and refuse to queue smaller ones. The device sets it.
++    const size_t deviceMinimum = static_cast<size_t>(
++            property_get_int64("ro.vendor.v4l2_codec2.min_input_buffer_size", 0));
++
+     // Enlarge the input buffer for 4k video
+-    if (area > k1080pArea) return kInputBufferSizeFor4K;
+-    return kInputBufferSizeFor1080p;
++    if (area > k1080pArea) return std::max(kInputBufferSizeFor4K, deviceMinimum);
++    return std::max(kInputBufferSizeFor1080p, deviceMinimum);
+ }
+ }  // namespace
+ 

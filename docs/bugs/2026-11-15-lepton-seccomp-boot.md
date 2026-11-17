@@ -44,7 +44,8 @@ newer one were the identity calls.
 `bin/wgapps`: `cmd_start` always passes `write_seccomp` (our own allow-by-default profile; it
 denies kernel modules, kexec, clock changes and `open_by_handle_at`, and fakes only `setpriority`,
 `nice` and similar calls Android needs at boot). `install` no longer copies Lepton's profile and
-deletes a copy left by an older install; `start` also deletes it. 
+deletes a copy left by an older install; `start` also deletes it. `wgapps report` says which
+profile is used and whether Lepton is installed.
 
 ## Tests (reproductions)
 
@@ -53,8 +54,9 @@ deletes a copy left by an older install; `start` also deletes it.
 | The shape of the Lepton profile that broke installs | `tests/test_seccomp.py` `test_lepton_2026_10_09_fakes_the_identity_calls` (fixture `tests/fixtures/seccomp-lepton-2026-10-09.json`) |
 | Why a faked setuid means `Permission denied` on a 0550 binary | `test_the_mechanism_a_faked_setuid_leaves_init_unable_to_exec_logd` |
 | Our profile never fakes setuid/setgid/setgroups/chown, and still fakes `setpriority`/`nice` | `test_our_profile_never_fakes_the_identity_calls`, `test_our_profile_still_fakes_what_android_needs_at_boot` |
-| `start` never uses Lepton's profile; install removes an old copy | `StartUsesOurProfileTests` |
+| `start` never uses Lepton's profile; install removes an old copy | `StartUsesOurProfileTests`, `tests/test_install_flavors.py` `InstallTests` |
 | Fresh installs of **both** flavors: GAPPS (default) and VANILLA download the right system image, record the right marker, switching flavor re-downloads, a corrupt image is refused | `tests/test_install_flavors.py` `FetchImagesTests` (real `fetch-images.sh`, stub OTA, local zips) |
+| `wgapps install` for both flavors: flavor remembered, GSF step only with Google apps, Lepton's profile never copied even when installed | `InstallTests` |
 
 A unit test cannot boot Android; the boot is checked on a Frame:
 

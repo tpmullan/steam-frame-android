@@ -1,0 +1,54 @@
+--- a/1.0/utils/Component.cpp
++++ b/1.0/utils/Component.cpp
+@@ -284,7 +284,10 @@
+         const sp<HGraphicBufferProducer2>& surface) {
+     std::shared_ptr<C2BlockPool> pool;
+     GetCodec2BlockPool(blockPoolId, mComponent, &pool);
+-    if (pool && pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE) {
++    if (pool && (pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE ||
++         // external/v4l2_codec2's V4L2_BUFFERQUEUE pool (C2VdaBqBlockPool) is a
++         // C2BufferQueueBlockPool and needs its producer configured too.
++         pool->getAllocatorId() == C2PlatformAllocatorStore::PLATFORM_END)) {
+         std::shared_ptr<C2BufferQueueBlockPool> bqPool =
+                 std::static_pointer_cast<C2BufferQueueBlockPool>(pool);
+         C2BufferQueueBlockPool::OnRenderCallback cb =
+--- a/1.1/utils/Component.cpp
++++ b/1.1/utils/Component.cpp
+@@ -284,7 +284,10 @@
+         const sp<HGraphicBufferProducer2>& surface) {
+     std::shared_ptr<C2BlockPool> pool;
+     GetCodec2BlockPool(blockPoolId, mComponent, &pool);
+-    if (pool && pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE) {
++    if (pool && (pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE ||
++         // external/v4l2_codec2's V4L2_BUFFERQUEUE pool (C2VdaBqBlockPool) is a
++         // C2BufferQueueBlockPool and needs its producer configured too.
++         pool->getAllocatorId() == C2PlatformAllocatorStore::PLATFORM_END)) {
+         std::shared_ptr<C2BufferQueueBlockPool> bqPool =
+                 std::static_pointer_cast<C2BufferQueueBlockPool>(pool);
+         C2BufferQueueBlockPool::OnRenderCallback cb =
+--- a/1.2/utils/Component.cpp
++++ b/1.2/utils/Component.cpp
+@@ -284,7 +284,10 @@
+         const sp<HGraphicBufferProducer2>& surface) {
+     std::shared_ptr<C2BlockPool> pool;
+     GetCodec2BlockPool(blockPoolId, mComponent, &pool);
+-    if (pool && pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE) {
++    if (pool && (pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE ||
++         // external/v4l2_codec2's V4L2_BUFFERQUEUE pool (C2VdaBqBlockPool) is a
++         // C2BufferQueueBlockPool and needs its producer configured too.
++         pool->getAllocatorId() == C2PlatformAllocatorStore::PLATFORM_END)) {
+         std::shared_ptr<C2BufferQueueBlockPool> bqPool =
+                 std::static_pointer_cast<C2BufferQueueBlockPool>(pool);
+         C2BufferQueueBlockPool::OnRenderCallback cb =
+@@ -482,7 +485,10 @@
+         const SurfaceSyncObj& syncObject) {
+     std::shared_ptr<C2BlockPool> pool;
+     GetCodec2BlockPool(blockPoolId, mComponent, &pool);
+-    if (pool && pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE) {
++    if (pool && (pool->getAllocatorId() == C2PlatformAllocatorStore::BUFFERQUEUE ||
++         // external/v4l2_codec2's V4L2_BUFFERQUEUE pool (C2VdaBqBlockPool) is a
++         // C2BufferQueueBlockPool and needs its producer configured too.
++         pool->getAllocatorId() == C2PlatformAllocatorStore::PLATFORM_END)) {
+         std::shared_ptr<C2BufferQueueBlockPool> bqPool =
+                 std::static_pointer_cast<C2BufferQueueBlockPool>(pool);
+         C2BufferQueueBlockPool::OnRenderCallback cb =

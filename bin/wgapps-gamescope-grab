@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Frames of what gamescope shows, from its PipeWire video node, as raw RGBA at the panel size.
+
+gamescope offers a `Video/Source` node. Nothing on SteamOS reads it (no GStreamer pipewiresrc, no
+ffmpeg input), so this is a small PipeWire client on libpipewire through ctypes: it asks for the raw
+format without a modifier (so buffers are shared memory, not dmabufs), takes BGRx frames and feeds
+them to ffmpeg, which scales to the panel and converts to RGBA on stdout.
+
+Usage: wgapps-gamescope-grab [--fps N] [--width W --height H]   (frames go to stdout)
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import struct
+import subprocess
+import sys
+
+DEBUG = False
+SPA_TYPE_ID, SPA_TYPE_RECTANGLE, SPA_TYPE_FRACTION, SPA_TYPE_CHOICE, SPA_TYPE_OBJECT = 3, 10, 11, 19, 15
+SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT, SPA_PARAM_FORMAT = 0x40003, 3, 4
+KEY_MEDIA_TYPE, KEY_MEDIA_SUBTYPE, KEY_VIDEO_FORMAT, KEY_VIDEO_SIZE, KEY_VIDEO_FRAMERATE = 1, 2, 0x20001, 0x20003, 0x20004
+MEDIA_TYPE_VIDEO, MEDIA_SUBTYPE_RAW, VIDEO_FORMAT_BGRX = 2, 1, 8
+CHOICE_RANGE = 1
+PW_DIRECTION_INPUT = 0
+PW_ID_ANY = 0xFFFFFFFF
+PW_STREAM_FLAG_AUTOCONNECT, PW_STREAM_FLAG_MAP_BUFFERS = 1, 4
+
+
+def _pad(data: bytes) -> bytes:
+    return data + b"\0" * (-len(data) % 8)
+
+
+def pod(kind: int, body: bytes) -> bytes:
+    """One SPA pod: size, type, body, padded to 8 bytes."""
+    return _pad(struct.pack("<II", len(body), kind) + body)
+
+
+def pod_id(value: int) -> bytes:
+    return pod(SPA_TYPE_ID, struct.pack("<I", value))
+
+
+def pod_rect(w: int, h: int) -> bytes:
+    return pod(SPA_TYPE_RECTANGLE, struct.pack("<II", w, h))
+
+
+def pod_frac(n: int, d: int) -> bytes:
+    return pod(SPA_TYPE_FRACTION, struct.pack("<II", n, d))
+
+
+def pod_choice_range(default: bytes, low: bytes, high: bytes) -> bytes:
+    """A Choice/Range of pods of the same type: the child pod header gives size and type once."""
+    child_size, child_type = struct.unpack("<II", default[:8])
+    values = b"".join(p[8 : 8 + child_size].ljust(child_size, b"\0") for p in (default, low, high))
+    body = struct.pack("<II", CHOICE_RANGE, 0) + struct.pack("<II", child_size, child_type) + values
+    return pod(SPA_TYPE_CHOICE, body)
+
+
+def prop(key: int, value: bytes) -> bytes:
+    return struct.pack("<II", key, 0) + value
+
+
+def format_param(width: int, height: int, fps: int) -> bytes:
+    """EnumFormat: raw video, BGRx, any size from 1x1 to 4096x4096 (default the panel's), up to
+    `fps`. No modifier property, so the producer falls back to shared-memory buffers."""
+    props = b"".join(
+        [
+            prop(KEY_MEDIA_TYPE, pod_id(MEDIA_TYPE_VIDEO)),
+            prop(KEY_MEDIA_SUBTYPE, pod_id(MEDIA_SUBTYPE_RAW)),
+            prop(KEY_VIDEO_FORMAT, pod_id(VIDEO_FORMAT_BGRX)),
+            prop(
+                KEY_VIDEO_SIZE,
+                pod_choice_range(pod_rect(width, height), pod_rect(1, 1), pod_rect(4096, 4096)),
+            ),
+            prop(
+                KEY_VIDEO_FRAMERATE,
+                pod_choice_range(pod_frac(fps, 1), pod_frac(0, 1), pod_frac(fps, 1)),
+            ),
+        ]
+    )
+    return pod(SPA_TYPE_OBJECT, struct.pack("<II", SPA_TYPE_OBJECT_FORMAT, SPA_PARAM_ENUM_FORMAT) + props)
+
+
+def parse_size(format_pod_address: int) -> tuple[int, int] | None:
+    """Width and height from a negotiated Format param (walks the object's properties)."""
+    header = ctypes.string_at(format_pod_address, 8)
+    size, _ = struct.unpack("<II", header)
+    body = ctypes.string_at(format_pod_address + 8, size)
+    offset = 8  # object_type, id
+    while offset + 16 <= len(body):
+        key, _flags = struct.unpack_from("<II", body, offset)
+        vsize, vtype = struct.unpack_from("<II", body, offset + 8)
+        if DEBUG:
+            print(f"  prop {key:#x} type {vtype} size {vsize}", file=sys.stderr)
+        if key == KEY_VIDEO_SIZE:
+            if vtype == SPA_TYPE_RECTANGLE:
+                return struct.unpack_from("<II", body, offset + 16)
+            if vtype == SPA_TYPE_CHOICE:
+                # A choice: type, flags, then the child pod header and the values; the first value
+                # is the default (a fixated format has exactly one).
+                _kind, _cflags, csize, ctype = struct.unpack_from("<IIII", body, offset + 16)
+                if ctype == SPA_TYPE_RECTANGLE and csize == 8:
+                    return struct.unpack_from("<II", body, offset + 32)
+        offset += 8 + 8 + ((vsize + 7) & ~7)
+    return None
+
+
+class SpaChunk(ctypes.Structure):
+    _fields_ = [("offset", ctypes.c_uint32), ("size", ctypes.c_uint32), ("stride", ctypes.c_int32), ("flags", ctypes.c_int32)]
+
+
+class SpaData(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("fd", ctypes.c_int64),
+        ("mapoffset", ctypes.c_uint32), ("maxsize", ctypes.c_uint32),
+        ("data", ctypes.c_void_p), ("chunk", ctypes.POINTER(SpaChunk)),
+    ]  # fmt: skip
+
+
+class SpaBuffer(ctypes.Structure):
+    _fields_ = [("n_metas", ctypes.c_uint32), ("n_datas", ctypes.c_uint32), ("metas", ctypes.c_void_p), ("datas", ctypes.POINTER(SpaData))]
+
+
+class PwBuffer(ctypes.Structure):
+    _fields_ = [("buffer", ctypes.POINTER(SpaBuffer)), ("user_data", ctypes.c_void_p), ("size", ctypes.c_uint64), ("requested", ctypes.c_uint64)]
+
+
+VOID_P = ctypes.c_void_p
+STATE_CB = ctypes.CFUNCTYPE(None, VOID_P, ctypes.c_int, ctypes.c_int, ctypes.c_char_p)
+PARAM_CB = ctypes.CFUNCTYPE(None, VOID_P, ctypes.c_uint32, VOID_P)
+PROCESS_CB = ctypes.CFUNCTYPE(None, VOID_P)
+
+
+class StreamEvents(ctypes.Structure):
+    _fields_ = [
+        ("version", ctypes.c_uint32), ("destroy", VOID_P), ("state_changed", STATE_CB),
+        ("control_info", VOID_P), ("io_changed", VOID_P), ("param_changed", PARAM_CB),
+        ("add_buffer", VOID_P), ("remove_buffer", VOID_P), ("process", PROCESS_CB),
+        ("drained", VOID_P), ("command", VOID_P), ("trigger_done", VOID_P),
+    ]  # fmt: skip
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--fps", type=int, default=5)
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--debug", action="store_true")
+    args = parser.parse_args(argv)
+    global DEBUG
+    DEBUG = args.debug
+    path = ctypes.util.find_library("pipewire-0.3") or "libpipewire-0.3.so.0"
+    pw = ctypes.CDLL(path)
+    pw.pw_properties_new.restype = VOID_P
+    pw.pw_main_loop_new.restype = VOID_P
+    pw.pw_main_loop_get_loop.restype = VOID_P
+    pw.pw_main_loop_get_loop.argtypes = [VOID_P]
+    pw.pw_stream_new_simple.restype = VOID_P
+    pw.pw_stream_new_simple.argtypes = [VOID_P, ctypes.c_char_p, VOID_P, ctypes.POINTER(StreamEvents), VOID_P]
+    pw.pw_stream_connect.argtypes = [VOID_P, ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(VOID_P), ctypes.c_uint32]
+    pw.pw_stream_dequeue_buffer.restype = ctypes.POINTER(PwBuffer)
+    pw.pw_stream_dequeue_buffer.argtypes = [VOID_P]
+    pw.pw_stream_queue_buffer.argtypes = [VOID_P, ctypes.POINTER(PwBuffer)]
+    pw.pw_main_loop_run.argtypes = [VOID_P]
+    pw.pw_main_loop_quit.argtypes = [VOID_P]
+    pw.pw_init(None, None)
+    loop = pw.pw_main_loop_new(None)
+    state = {"size": None, "frames": 0}
+    # ffmpeg scales and converts what we read; its stdout is our stdout.
+    ffmpeg = None
+
+    def start_ffmpeg(width: int, height: int):
+        return subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pixel_format", "bgr0",
+             "-video_size", f"{width}x{height}", "-framerate", str(args.fps), "-i", "-",
+             "-vf", f"scale={args.width}:{args.height},format=rgba", "-f", "rawvideo", "-"],
+            stdin=subprocess.PIPE, stdout=sys.stdout.buffer,
+        )  # fmt: skip
+
+    stream_box: list[int] = []
+
+    def on_state(_data, _old, new, error):
+        if DEBUG:
+            print("state", new, error, file=sys.stderr, flush=True)
+        if new == -1:  # PW_STREAM_STATE_ERROR
+            print("stream error:", error, file=sys.stderr)
+            pw.pw_main_loop_quit(loop)
+
+    def on_param(_data, param_id, param):
+        if param_id == SPA_PARAM_FORMAT and param:
+            state["size"] = parse_size(param)
+            print("negotiated", state["size"], file=sys.stderr, flush=True)
+
+    def on_process(_data):
+        nonlocal ffmpeg
+        buf = pw.pw_stream_dequeue_buffer(stream_box[0])
+        if not buf:
+            return
+        try:
+            data = buf.contents.buffer.contents.datas[0]
+            chunk = data.chunk.contents
+            if DEBUG and state["frames"] < 3:
+                print(f"buffer type {data.type} data {data.data} fd {data.fd} chunk size {chunk.size} stride {chunk.stride}", file=sys.stderr, flush=True)
+            if state["size"] and data.data and chunk.size:
+                width, height = state["size"]
+                if ffmpeg is None:
+                    ffmpeg = start_ffmpeg(width, height)
+                stride = chunk.stride or width * 4
+                raw = ctypes.string_at(data.data + chunk.offset, chunk.size)
+                rows = b"".join(raw[y * stride : y * stride + width * 4] for y in range(height))
+                ffmpeg.stdin.write(rows)
+                ffmpeg.stdin.flush()
+                state["frames"] += 1
+        except (BrokenPipeError, ValueError):
+            pw.pw_main_loop_quit(loop)
+        finally:
+            pw.pw_stream_queue_buffer(stream_box[0], buf)
+
+    events = StreamEvents(version=1, state_changed=STATE_CB(on_state), param_changed=PARAM_CB(on_param), process=PROCESS_CB(on_process))
+    props = pw.pw_properties_new(b"media.type", b"Video", b"media.category", b"Capture", b"media.role", b"Screen", b"target.object", b"gamescope", None)
+    stream = pw.pw_stream_new_simple(pw.pw_main_loop_get_loop(loop), b"wgapps-gamescope-grab", props, ctypes.byref(events), None)
+    stream_box.append(stream)
+    offered = format_param(1920, 1080, args.fps)
+    buffer = ctypes.create_string_buffer(offered, len(offered))
+    params = (VOID_P * 1)(ctypes.cast(buffer, VOID_P))
+    flags = PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS
+    if pw.pw_stream_connect(stream, PW_DIRECTION_INPUT, PW_ID_ANY, flags, params, 1) < 0:
+        print("cannot connect the stream", file=sys.stderr)
+        return 1
+    try:
+        pw.pw_main_loop_run(loop)
+    except KeyboardInterrupt:
+        pass
+    if ffmpeg is not None:
+        ffmpeg.stdin.close()
+        ffmpeg.wait()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

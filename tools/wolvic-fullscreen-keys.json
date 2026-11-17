@@ -1,0 +1,4 @@
+[
+  {"keys": ["KEYCODE_F"], "wait": 8},
+  {"keys": ["KEYCODE_ESCAPE"], "wait": 8}
+]

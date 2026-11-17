@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Requests from the VR shell about a 2D app's panel: open it, tap it, close it.
+
+The shell shows a 2D Android app on a virtual display. An app may not inject input into another
+display, and it may not start apps there either, so the shell appends one line per request to
+panel-input in the folder shared with Android: `tap <display> <x> <y>` (a controller click on the
+panel), `open <display> <package/activity>` (start the app on its virtual display) and
+`swipe <display> x1 y1 x2 y2 ms` (scroll), `close <package>` (stop it), `mode panel|vr` (leave VR for the flat panel, or come back). This takes the file, checks each line and runs the matching command in
+the container (`input -d`, `am start --display`, `am force-stop`). Anything else is dropped.
+
+Usage: wgapps-panelinput [--interval SECONDS]
+Environment: WGAPPS_BASE (default ~/.local/share/waydroid-gapps), WGAPPS_SHARE
+(default $WGAPPS_BASE/share), WGAPPS_CONTAINER (default waydroid-gapps)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import time
+
+MAX_PER_BATCH = 20
+TAP = re.compile(r"tap ([0-9]{1,2}) ([0-9]{1,4}) ([0-9]{1,4})")
+OPEN = re.compile(r"open ([0-9]{1,2}) ([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)")
+CLOSE = re.compile(r"close ([A-Za-z0-9_.]+)")
+MODE = re.compile(r"mode (panel|vr)")
+SWIPE = re.compile(r"swipe ([0-9]{1,2}) ([0-9]{1,4}) ([0-9]{1,4}) ([0-9]{1,4}) ([0-9]{1,4}) ([0-9]{1,3})")
+SHELL = "rs.starforge.xrhost"
+
+
+def log(msg: str) -> None:
+    print(time.strftime("%F %T"), "wgapps-panelinput:", msg, file=sys.stderr, flush=True)
+
+
+def parse(text: str) -> list[tuple]:
+    """The valid requests in `text`, in order (display 1-99, never the main display; coordinates
+    below 8192): ("tap", display, x, y), ("open", display, component), ("close", package)."""
+    requests: list[tuple] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if match := TAP.fullmatch(line):
+            display, x, y = (int(g) for g in match.groups())
+            if 1 <= display <= 99 and x < 8192 and y < 8192:
+                requests.append(("tap", display, x, y))
+        elif match := OPEN.fullmatch(line):
+            display = int(match.group(1))
+            if 1 <= display <= 99:
+                requests.append(("open", display, match.group(2)))
+        elif match := SWIPE.fullmatch(line):
+            display, x1, y1, x2, y2, ms = (int(g) for g in match.groups())
+            if 1 <= display <= 99 and max(x1, y1, x2, y2) < 8192 and 10 <= ms <= 999:
+                requests.append(("swipe", display, x1, y1, x2, y2, ms))
+        elif match := CLOSE.fullmatch(line):
+            requests.append(("close", match.group(1)))
+        elif match := MODE.fullmatch(line):
+            requests.append(("mode", match.group(1)))
+        if len(requests) == MAX_PER_BATCH:
+            break
+    return requests
+
+
+def command(container: str, request: tuple) -> list[str]:
+    base = ["podman", "exec", container]
+    match request:
+        case ("tap", display, x, y):
+            return base + ["input", "-d", str(display), "tap", str(x), str(y)]
+        case ("swipe", display, x1, y1, x2, y2, ms):
+            return base + ["input", "-d", str(display), "swipe", *map(str, (x1, y1, x2, y2, ms))]
+        case ("open", display, component):
+            return base + ["am", "start", "--display", str(display), "-n", component]
+        case ("close", package):
+            return base + ["am", "force-stop", package]
+        case ("mode", "panel"):
+            # Leave VR: stop the shell; Android's home shows on the flat panel again.
+            return base + ["sh", "-c", f"am force-stop {SHELL}; input keyevent 3"]
+        case ("mode", "vr"):
+            return base + ["am", "start", "-n", f"{SHELL}/rs.starforge.Activity"]
+    raise ValueError(request)
+
+
+def xr_packages(share: pathlib.Path) -> list[str]:
+    """Packages the shell's catalog (apps.tsv: package, label, component, kind) marks as VR apps."""
+    try:
+        lines = (share / "apps.tsv").read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    found = []
+    for line in lines:
+        columns = line.split("\t")
+        if len(columns) >= 4 and columns[3].strip() == "xr" and CLOSE.fullmatch(f"close {columns[0]}"):
+            found.append(columns[0])
+    return found
+
+
+def commands(container: str, request: tuple, share: pathlib.Path) -> list[list[str]]:
+    """What to run for a request. Going to VR first stops the VR apps that may still be running:
+    SteamVR keeps one scene app per Steam app key (all Android apps share one) and refuses a new one
+    until the old has quit."""
+    if request == ("mode", "vr"):
+        stops = [command(container, ("close", package)) for package in xr_packages(share)]
+        return stops + [command(container, request)]
+    return [command(container, request)]
+
+
+def consume(path: pathlib.Path) -> str | None:
+    """Take the request file: renamed first, so a writer that appends later starts a new one."""
+    taken = path.with_name(path.name + ".taking")
+    try:
+        os.rename(path, taken)
+    except OSError:
+        return None
+    try:
+        return taken.read_text(errors="replace")
+    except OSError:
+        return None
+    finally:
+        taken.unlink(missing_ok=True)
+
+
+def run_once(path: pathlib.Path, container: str, runner) -> int:
+    text = consume(path)
+    if text is None:
+        return 0
+    requests = parse(text)
+    for request in requests:
+        for argv in commands(container, request, path.parent):
+            runner(argv)
+    return len(requests)
+
+
+def _run(command: list[str]) -> None:
+    subprocess.run(command, check=False, capture_output=True, timeout=10)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--interval", type=float, default=0.1)
+    args = parser.parse_args(argv)
+    base = pathlib.Path(os.environ.get("WGAPPS_BASE", "~/.local/share/waydroid-gapps")).expanduser()
+    share = pathlib.Path(os.environ.get("WGAPPS_SHARE", str(base / "share")))
+    container = os.environ.get("WGAPPS_CONTAINER", "waydroid-gapps")
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    while not stop:
+        try:
+            run_once(share / "panel-input", container, _run)
+        except Exception as error:  # a helper must outlive one bad request
+            log(f"request failed: {error}")
+        time.sleep(args.interval)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

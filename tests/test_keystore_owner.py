@@ -6,9 +6,7 @@ uid 1017, open() fails with EACCES, keystore2 panics "Failed to attach database 
 Android loops. Reported on issue 2 by a user who reinstalled over data from that era.
 """
 
-import os
 import pathlib
-import stat
 import subprocess
 import tempfile
 import unittest
@@ -46,7 +44,7 @@ class KeystoreOwnerTests(unittest.TestCase):
 
     def test_start_repairs_before_android_boots_and_inside_the_user_namespace(self):
         script = BIN.read_text()
-        start = script[script.index("cmd_start() {"):]
+        start = script[script.index("cmd_start() {") :]
         self.assertIn('podman unshare "$0" _repair-keystore "$DATA/misc/keystore"', start)
         self.assertLess(start.index("_repair-keystore"), start.index('podman "${ARGS[@]}"'))
 

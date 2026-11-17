@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The VR shell (V1 of the roadmap): Android's launcher in VR mode. A system app that bin/wgapps
+     mounts under /system/priv-app only when `wgapps mode vr` is set and lib/WgappsShell.apk exists,
+     and starts after boot. It reads the app catalog the host writes to the shared folder; it
+     needs no permission of its own yet (V2 adds the trusted display for app windows). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.wgapps.shell">
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33" />
+    <uses-feature android:glEsVersion="0x00030002" android:required="true" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="false" android:version="1" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+    <application android:label="Wgapps shell" android:allowBackup="false" android:extractNativeLibs="false"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <activity android:name=".ShellActivity" android:exported="true" android:launchMode="singleTask"
+            android:label="Wgapps shell">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <!-- The OpenXR scene (native/shell.c). Present in every build; the host launches it only
+             when the build had the native part (lib/WgappsShell.vr next to the APK). -->
+        <activity android:name=".VrShellActivity" android:exported="true" android:launchMode="singleTask"
+            android:label="Wgapps VR shell" android:resizeableActivity="false"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|uiMode|navigation|density">
+            <meta-data android:name="android.app.lib_name" android:value="wgshell" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,0 +1,43 @@
+--- a/plugin_store/include/v4l2_codec2/plugin_store/C2VdaBqBlockPool.h
++++ b/plugin_store/include/v4l2_codec2/plugin_store/C2VdaBqBlockPool.h
+@@ -58,6 +58,11 @@
+     void setRenderCallback(const C2BufferQueueBlockPool::OnRenderCallback& renderCallback =
+                                    C2BufferQueueBlockPool::OnRenderCallback()) override;
+     void configureProducer(const android::sp<HGraphicBufferProducer>& producer) override;
++    // The variant Android 12+'s HIDL layer calls (with shared sync memory). This pool keeps its own
++    // producer bookkeeping and has no use for the sync memory, so only the producer matters.
++    void configureProducer(const android::sp<HGraphicBufferProducer>& producer,
++                           native_handle_t* syncMemory, uint64_t bqId, uint32_t generationId,
++                           uint64_t consumerUsage) override;
+ 
+     /**
+      * Sends the request of arbitrary number of graphic buffers allocation. If producer is given,
+--- a/plugin_store/C2VdaBqBlockPool.cpp
++++ b/plugin_store/C2VdaBqBlockPool.cpp
+@@ -21,6 +21,7 @@
+ #include <C2SurfaceSyncObj.h>
+ #include <android/hardware/graphics/bufferqueue/2.0/IProducerListener.h>
+ #include <base/callback.h>
++#include <cutils/native_handle.h>
+ #include <log/log.h>
+ #include <ui/BufferQueueDefs.h>
+ 
+@@ -934,6 +935,18 @@
+     return C2_NO_INIT;
+ }
+ 
++void C2VdaBqBlockPool::configureProducer(const sp<HGraphicBufferProducer>& producer,
++                                         native_handle_t* syncMemory, uint64_t /* bqId */,
++                                         uint32_t /* generationId */,
++                                         uint64_t /* consumerUsage */) {
++    // Ownership of the sync memory comes with the call; this pool does not use it.
++    if (syncMemory != nullptr) {
++        native_handle_close(syncMemory);
++        native_handle_delete(syncMemory);
++    }
++    configureProducer(producer);
++}
++
+ void C2VdaBqBlockPool::configureProducer(const sp<HGraphicBufferProducer>& producer) {
+     if (mImpl) {
+         mImpl->configureProducer(producer);

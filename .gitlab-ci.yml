@@ -13,6 +13,7 @@
 stages:
   - lint
   - test
+  - deps
   - build
 
 workflow:
@@ -28,9 +29,9 @@ variables:
   PUBLIC_IMAGE: ghcr.io/tpmullan/steam-frame-android
   SHELL_FILES: >-
     bin/wgapps bin/fetch-images.sh tools/deploy.sh tools/build-image.sh
-    overrides/system/etc/wgapps-net.sh
+    tools/build-libgbinder.sh tools/build-android-libs.sh tools/build-settings-app.sh tools/build-shell.sh tools/build-quad2d.sh overrides/system/etc/wgapps-net.sh
   PY_FILES: >-
-    bin/wgapps-pad bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
+    bin/wgapps-pad bin/wgapps-battery bin/wgapps-clipboard bin/wgapps-profiles bin/wgapps-appwatch bin/wgapps-ota bin/wgapps-gen-overrides bin/steam-shortcuts.py
     tools/sfa_release.py tests
 
 # --- lint and tests --------------------------------------------------------
@@ -39,7 +40,7 @@ shellcheck:
   stage: lint
   image: koalaman/shellcheck-alpine:v0.10.0
   script:
-    - shellcheck $SHELL_FILES
+    - shellcheck -x $SHELL_FILES
 
 shfmt:
   stage: lint
@@ -59,20 +60,59 @@ unit-tests:
   image: python:3.12-alpine
   needs: []
   script:
-    - apk add --no-cache git >/dev/null
+    - apk add --no-cache git bash >/dev/null
     - cd tests && python -m unittest -v
 
 # --- build ---------------------------------------------------------------
 
-# A FROM scratch image of plain files: no emulation is needed to build the
-# arm64 variant on the amd64 runners (no RUN steps).
+# libgbinder for the host-side clipboard service, built natively on the arm64
+# runners from pinned tarballs (tools/libgbinder.env). Its log shows the
+# architecture, soname and dependencies of the result.
+libgbinder:
+  stage: deps
+  image: debian:bookworm-slim
+  needs: []
+  script:
+    - apt-get update -qq
+    - >-
+      apt-get install -y -qq --no-install-recommends
+      build-essential pkg-config libglib2.0-dev curl ca-certificates >/dev/null
+    - tools/build-libgbinder.sh lib
+  artifacts:
+    paths:
+      - lib/
+    expire_in: 30 days
+
+# Our own Android libraries (xr-layer/, gbm-lock/), tested on the runner and then
+# cross-compiled with the distribution's clang against pinned OpenXR headers
+# (tools/xr-layer.env). Its log shows the test result and the library's
+# architecture, soname and dependencies.
+android-libs:
+  stage: deps
+  image: debian:bookworm-slim
+  needs: []
+  variables:
+    HOST_CC: clang
+  script:
+    - apt-get update -qq
+    - >-
+      apt-get install -y -qq --no-install-recommends
+      clang lld libc6-dev curl ca-certificates >/dev/null
+    - tools/build-android-libs.sh lib
+  artifacts:
+    paths:
+      - lib/
+    expire_in: 30 days
+
+# The release image is a FROM scratch bundle of files built on the arm64
+# runners (COPY only, no RUN steps).
 .build:
   stage: build
   image: docker:27.5.1
   services:
     - name: docker:27.5.1-dind
       alias: docker
-  needs: [shellcheck, shfmt, ruff, unit-tests]
+  needs: [shellcheck, shfmt, ruff, unit-tests, libgbinder, android-libs]
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""

@@ -1,0 +1,19 @@
+[package]
+name = "starforge-xr-host"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "OpenXR host for the Starforge shell on Android (R0 of the VR shell plan): an OpenXR session with a quad panel."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.14"
+glow = "0.16"
+khronos-egl = { version = "6", features = ["dynamic"] }
+log = { workspace = true }
+openxr = { version = "0.19", features = ["loaded"] }

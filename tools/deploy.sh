@@ -11,6 +11,9 @@ BASE="${FRAME_BASE:-.local/share/waydroid-gapps}"
 # shellcheck disable=SC2029 # $BASE is meant to expand here
 ssh "$HOST" "mkdir -p $BASE && rm -rf $BASE/overrides"
 scp -q -r "$HERE/bin" "$HERE/overrides" "$HERE/VERSION" "$HOST:$BASE/"
+# lib/ comes from tools/build-libgbinder.sh and tools/build-android-libs.sh (or
+# the CI artifacts).
+if [[ -d "$HERE/lib" ]]; then scp -q -r "$HERE/lib" "$HOST:$BASE/"; fi
 # shellcheck disable=SC2029
 ssh "$HOST" "rm -rf $BASE/bin/__pycache__ && chmod 0755 $BASE/bin/* && find $BASE/overrides -type f -exec chmod 0644 {} +"
 echo "deployed $(cat "$HERE/VERSION") to $HOST:~/$BASE"

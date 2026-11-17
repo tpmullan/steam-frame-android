@@ -1,0 +1,15 @@
+--- a/components/V4L2Decoder.cpp
++++ b/components/V4L2Decoder.cpp
+@@ -174,7 +174,11 @@
+     }
+ 
+     // Setup the input format.
+-    auto format = mInputQueue->setFormat(inputPixelFormat, ui::Size(), inputBufferSize, 0);
++    // A stateful decoder learns the real coded size from the stream (V4L2_EVENT_SOURCE_CHANGE), but
++    // some, such as Qualcomm's iris, refuse to request buffers (-EINVAL, "current session not
++    // supported") while the input format still has a 0x0 size. Start from a plausible size.
++    auto format = mInputQueue->setFormat(inputPixelFormat, ui::Size(1280, 720), inputBufferSize,
++                                         0);
+     if (!format) {
+         ALOGE("Failed to call IOCTL to set input format.");
+         return false;

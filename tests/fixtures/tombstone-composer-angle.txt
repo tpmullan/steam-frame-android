@@ -1,0 +1,16 @@
+*** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+Build fingerprint: 'lineage/lineage_waydroid_arm64_only/waydroid_arm64_only:13/TQ3A.230901.001/eng.root.20260927.011114:userdebug/test-keys'
+Timestamp: 2026-11-15 12:33:58.620539263-0800
+Cmdline: /vendor/bin/hw/android.hardware.graphics.composer@2.1-service --desktop_file_hint=Waydroid.desktop
+signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0000000000000000
+Cause: null pointer dereference
+backtrace:
+      #00 pc 0000000000000000  <unknown>
+      #01 pc 00000000004e5ccc  /vendor/lib64/egl/libGLESv2_angle.so (egl::Image::onDestroy(egl::Display const*)+112) (BuildId: 14ca4bdeea8b892a24235ce68f44211d)
+      #02 pc 00000000004d1a3c  /vendor/lib64/egl/libGLESv2_angle.so (egl::Display::createImage(gl::Context*, unsigned int, void*, egl::AttributeMap const&, egl::Image**)+584) (BuildId: 14ca4bdeea8b892a24235ce68f44211d)
+      #03 pc 00000000005ac51c  /vendor/lib64/egl/libGLESv2_angle.so (egl::CreateImageKHR(egl::Thread*, egl::Display*, gl::Context*, unsigned int, void*, egl::AttributeMap const&)+156) (BuildId: 14ca4bdeea8b892a24235ce68f44211d)
+      #04 pc 00000000005b8530  /vendor/lib64/egl/libGLESv2_angle.so (EGL_CreateImageKHR+172) (BuildId: 14ca4bdeea8b892a24235ce68f44211d)
+      #05 pc 000000000004b148  /vendor/lib64/egl/libEGL_angle.so (eglCreateImageKHR+72) (BuildId: de29f8a6fad383bbd16c5bedb373148a)
+      #06 pc 000000000001c968  /system/lib64/libEGL.so (eglCreateImageKHR+76) (BuildId: 4becc7c3c17792610bc334ae34598e07)
+      #07 pc 0000000000004ac08  /vendor/lib64/hw/hwcomposer.waydroid.so (egl_render_to_pixels(display*, buffer*)+172) (BuildId: 8937ba8f2556cc3e0050372676e63c9d)
+      #08 pc 0000000000004ad34  /vendor/lib64/hw/hwcomposer.waydroid.so (egl_loop(void*)+88) (BuildId: 8937ba8f2556cc3e0050372676e63c9d)

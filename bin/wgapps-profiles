@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Take over changes made on the per-app screen in Android's Settings.
+
+The screen (settings-app/) writes the whole list of per-app overrides to
+device-profiles.conf in the folder shared with Android, in the format of
+apps.conf. The host mirrors apps.conf to the same file after every change of
+its own, so the two agree except for a moment after a change on either side.
+This polls them; when they differ on two polls in a row, it runs
+`wgapps app import` on the file, which validates it, makes it the new apps.conf
+and applies it.
+
+The screen's launch-type rows work the same way through app-kinds.conf and
+apps-kind (`wgapps apps kind-import`), and the Steam Frame mode screen through
+app-mode.conf and mode (`wgapps mode import`).
+
+A file that was rejected is not tried again until its content changes.
+
+Usage: wgapps-profiles [--interval SECONDS]
+Environment: WGAPPS_BASE (default ~/.local/share/waydroid-gapps), WGAPPS_SHARE
+(default $WGAPPS_BASE/share), WGAPPS_BIN (default $WGAPPS_BASE/bin)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+DIFFERENT_POLLS = 2
+
+
+def log(msg: str) -> None:
+    print(time.strftime("%F %T"), "wgapps-profiles:", msg, file=sys.stderr, flush=True)
+
+
+def new_state() -> dict:
+    return {"differing": 0, "tried": None}
+
+
+def _read(path: pathlib.Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def import_command(
+    bin_dir: pathlib.Path, share_file: pathlib.Path, verb: tuple[str, ...] = ("app", "import")
+) -> list[str]:
+    return [str(bin_dir / "wgapps"), *verb, str(share_file)]
+
+
+def poll(state: dict, share_file: pathlib.Path, conf_file: pathlib.Path, run_import) -> dict:
+    """One look at the two files; returns the new state. `run_import(path)` returns whether
+    the import was accepted."""
+    shared = _read(share_file)
+    if shared is None:  # Android has not written one: the host's settings stand.
+        return new_state()
+    ours = _read(conf_file) or b""
+    if shared == ours:
+        return new_state()
+    digest = hashlib.sha256(shared).hexdigest()
+    if digest == state["tried"]:
+        return state
+    differing = state["differing"] + 1
+    if differing < DIFFERENT_POLLS:
+        return {"differing": differing, "tried": None}
+    try:
+        accepted = run_import(share_file)
+    except Exception as error:  # Never let one bad file end the loop.
+        log(f"import failed: {error}")
+        accepted = False
+    if not accepted:
+        log("the file was not accepted; ignoring it until it changes")
+    return {"differing": 0, "tried": digest}
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Apply the device profiles chosen in Android")
+    parser.add_argument("--interval", type=float, default=1.0)
+    args = parser.parse_args(argv)
+    base = pathlib.Path(
+        os.environ.get("WGAPPS_BASE", pathlib.Path.home() / ".local/share/waydroid-gapps")
+    )
+    share_dir = pathlib.Path(os.environ.get("WGAPPS_SHARE", base / "share"))
+    bin_dir = pathlib.Path(os.environ.get("WGAPPS_BIN", base / "bin"))
+    # (file Android writes, the host's own copy, the wgapps command that takes it over)
+    watched = [
+        (share_dir / "device-profiles.conf", base / "apps.conf", ("app", "import")),
+        (share_dir / "app-kinds.conf", base / "apps-kind", ("apps", "kind-import")),
+        (share_dir / "app-mode.conf", base / "mode", ("mode", "import")),
+    ]
+
+    def importer(verb: tuple[str, ...]):
+        def run_import(path: pathlib.Path) -> bool:
+            done = subprocess.run(import_command(bin_dir, path, verb), timeout=60, check=False)
+            return done.returncode == 0
+
+        return run_import
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    states = [new_state() for _ in watched]
+    try:
+        while True:
+            for i, (share, conf, verb) in enumerate(watched):
+                states[i] = poll(states[i], share, conf, importer(verb))
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

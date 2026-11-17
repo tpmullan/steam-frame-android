@@ -62,6 +62,90 @@ The pointer works as a touchscreen. Controller buttons act as a TV remote:
 | D-pad | Navigate, seek |
 | LB / RB | Rewind / fast-forward |
 
+## Per-app overrides
+
+Some apps choose their controllers or features by the device model Android
+reports, and a headset they have never heard of gets the bare minimum. Instead
+of patching each app, tell Android to report something else to one app only:
+
+```sh
+W=~/.local/share/waydroid-gapps/bin/wgapps
+$W app set com.igalia.wolvic.vanilla model "Quest 3"
+$W app list
+$W app unset com.igalia.wolvic.vanilla          # or: ... unset <package> model
+```
+
+Keys are `model`, `manufacturer`, `brand` and `device`; each sets every copy of
+that property Android keeps (`ro.product.model`, `ro.product.vendor.model`, ...),
+so Java's `Build.MODEL` and native code agree. Values are 1-91 letters, digits,
+spaces and `. _ + ( ) / : -`; package names are at most 54 characters. The
+settings live in `apps.conf` next to the scripts, survive updates, and apply at
+Android's next start. While Android runs, a change reaches the app the next
+time it starts (`wgapps sh am force-stop <package>`).
+
+### The Settings screen
+
+With `lib/WgappsSettings.apk` installed, Android's own Settings has **System >
+Device profile per app**: a list of your apps and, per app, radio choices like a
+permission's (Default, Meta Quest 3 / 3S / Pro / 2, Pico 4 / 4 Ultra, or a model
+you type). It writes the same settings as `wgapps app set`, the two always show
+each other's changes, and a choice applies the next time the app starts. The same
+screen has a **Launch type in VR mode** section (Detected, VR app or Flat app), the
+setting behind `wgapps apps kind`; it travels as `app-kinds.conf` and the helper
+applies it with `wgapps apps kind-import`. A second entry, **System > Steam Frame
+mode**, picks Steam mode or VR mode (`app-mode.conf`, `wgapps mode import`); VR mode
+is refused, and the choice snaps back, when the shell is not installed.
+
+Build and install it (needs the Android SDK, JDK 11+; the APK is not in the
+release, which forbids APKs):
+
+```sh
+tools/build-settings-app.sh /tmp/out
+scp /tmp/out/WgappsSettings.apk steamos@frame:.local/share/waydroid-gapps/lib/
+```
+
+then restart Android. Android lists extra Settings screens only from system
+apps, so `wgapps start` mounts the APK under `/system/priv-app`; nothing is
+installed into Android's data. The screen and the host talk through
+`device-profiles.conf` in the folder shared with Android, which `wgapps start`
+makes world-writable (every user ID in the container is a sub-ID of yours), and
+the `wgapps-profiles` helper applies a changed file with `wgapps app import`.
+
+How it works and what it costs: Android's `wrap.<package>` property runs an
+app's main process through a preload (`libwgapps_props.so`) that overwrites the
+property in that process's own copy of Android's property area. Nothing else,
+and no other app, sees it. An app started this way is not forked from Android's
+zygote, so it starts a little slower and Android logs one harmless
+`SIGSYS` crash report for a helper process each time it starts. Only the app's
+main process is covered, not its `:service` processes. Properties stored next to
+an overridden one stop updating in that process, which is fine for the
+read-only `ro.product.*` ones this is meant for.
+
+## Steam mode: every Android app in the Steam library
+
+Android runs as one container and one panel in gamescope. Steam mode puts each Android app in the
+Steam library, so you launch, switch and quit them from Steam like any game.
+
+- `wgapps apps list` prints what you can open: package, name, launcher activity, and `kind` (`xr`
+  for an OpenXR app such as Wolvic or hello_xr, `2d` otherwise). Names come from the Settings app,
+  so keep `WgappsSettings.apk` installed; without it names fall back to the package's last part.
+  Hide an app by adding its package to `~/.local/share/waydroid-gapps/apps-hidden`; override the
+  detected kind with `wgapps apps kind <package> xr|2d|auto`.
+- `wgapps apps sync` makes the library match: one shortcut per app, and the shortcuts of apps you
+  uninstalled are removed. It never touches shortcuts that are not `wgapps steam <package>`
+  launches, and keeps the base "Android" entry. With Steam running it adds and removes them live
+  through Steam's own debug port (Steam must be started with `-cef-enable-debugging`, as on the
+  Frame); with Steam closed it edits `shortcuts.vdf`. Give new entries the default Gamepad layout.
+- The first entry you launch starts Android and owns the panel (overlay, Quit). Entries you launch
+  after that attach to the running Android: they open their app, never restart Android, and end
+  when you quit the app inside Android. Quitting an attached entry from Steam stops only that app;
+  quitting the first entry stops Android, and every app with it.
+- `wgapps windows floating` opens apps as movable windows inside that one panel; `single` (the
+  default) makes each app fill it. It applies when Android next starts and survives updates.
+
+Limits: Steam sees one window (one Steam app id owns the panel), so there are no separate panels per
+app, and apps share one Android, with no isolation between them. For isolation, use Lepton.
+
 ## Update, roll back, remove
 
 ```sh
@@ -72,10 +156,78 @@ $W rollback          # undo the last update
 $W uninstall --yes   # removes everything, including Android data
 ```
 
+## VR mode (early)
+
+`wgapps mode` shows the mode; `wgapps mode env room|home|solid [#rrggbb]` picks what the Rust shell shows behind its panels (SteamVR's room view, a simple 3D space with a floor grid, or a solid colour); `wgapps mode vr` switches to the VR shell (needs
+`lib/WgappsShell.apk`, built by `tools/build-shell.sh /tmp/out` like the Settings
+APK, then copied to `~/.local/share/waydroid-gapps/lib/` with `WgappsShell.vr` when
+the build had the NDK; restart Android). A Rust build on the Starforge engine
+(`lib/StarforgeShell.apk`, package `rs.starforge.xrhost`) is used instead when it is
+installed; it has the same library, tabs and dock and is built in the engine's repo
+(`runtime-rust/xr-host`, `store-native-libs` on). The shell is an OpenXR panel in front of
+you: a library of your Android apps with their icons (VR apps first), filter
+tabs and a dock, styled after Android's launcher, Steam's library and Quest-style
+panels ([design note](docs/superpowers/design/vr-shell-look.md)). Without the
+NDK the build is a flat grid instead. With the Rust build the controllers point
+at the panel with a beam, a trigger click launches an app (2D apps open as
+movable window panels), the thumbstick scrolls, and a grip moves a window (the
+thumbstick then resizes it). `wgapps view panel|vr` switches between the flat
+panel and the VR shell. If the shell fails to start three times in a row, `wgapps` goes back to
+`wgapps mode steam` and says so. `wgapps mode home on|off` stores the 3D-home
+setting for later. `wgapps apps push` writes the app list the shell reads.
+
+## Render resolution
+
+SteamVR recommends rendering at 80% of the Frame's panel in each direction (1728 of 2160 pixels per eye), and OpenXR
+apps such as Wolvic size their render targets from that alone, so everything is upscaled and looks soft. The OpenXR
+layer in `xr-layer/` multiplies the recommendation by `wgapps xr scale` (default 1.25, which is the panel's own
+2160x2160). `wgapps xr scale 1.0` turns it off, `wgapps xr scale default` restores 1.25, and a change applies
+the next time Android starts. It costs about 56% more pixels; heavy scenes may need a lower value.
+
+## Freeze after leaving fullscreen video
+
+Mesa's Android EGL answers `eglQuerySurface(EGL_BUFFER_AGE_EXT)` by dequeuing the next back buffer with the display
+lock held. If the thread that would free a buffer needs that lock, the app's frames stop for good: Wolvic froze a
+few seconds after leaving a fullscreen 360 video. `lib/libwgapps_egl_layer.so` is a small GLES layer that Android's
+libEGL loads (`debug.gles.layers`, from `/data/local/debug/gles`); it answers that one query with 0, which the
+extension defines as "contents undefined", and passes every other call on. `WGAPPS_EGL_LAYER=0 wgapps start`
+turns it off. Measured so far: 3 freezes in 96 exits without the layer, none in 35 with it (a run too short to
+be proof); details and the measurements are in the
+[spike notes](docs/superpowers/spikes/S3-S4-S5-partial.md).
+
+## GPU option: ANGLE
+
+By default Android's OpenGL ES comes from Mesa (freedreno). Mesa has a locking
+bug that can freeze an app (seen in Wolvic after leaving fullscreen 360 video).
+`wgapps gpu egl angle` switches OpenGL ES to ANGLE on top of the Vulkan driver,
+and the freeze does not happen. Restart Android after changing it.
+
+```sh
+W=~/.local/share/waydroid-gapps/bin/wgapps
+$W gpu egl            # show the current choice (mesa by default)
+$W gpu egl angle      # try ANGLE
+$W gpu egl mesa       # back to the default
+```
+
+With ANGLE, the display's composer service still uses Mesa's EGL (it imports
+Android's graphics buffers, which crashes ANGLE on this driver); `wgapps`
+arranges that when it starts Android (details and tests:
+[docs/bugs/2026-11-15-angle-composer-crash.md](docs/bugs/2026-11-15-angle-composer-crash.md)). Browsers, Chrome, Plex, Settings,
+pointing at the panel and OpenXR apps that use Vulkan work. OpenXR apps that
+use OpenGL ES with a depth buffer do not (OpenGL ES 3.1 only, and SteamVR
+cannot share the depth image), which is why it is not the default.
+
+## Reporting a problem
+
+`wgapps report` writes a diagnostics file (no passwords or account data) to attach
+to an issue; [docs/runbook-logs.md](docs/runbook-logs.md) says when to run it.
+
 ## Known limits
 
-- Video decodes in software (fine for 1080p H.264/HEVC). Hardware decoding
-  needs a V4L2 Codec2 HAL and is planned.
+- Video decodes in software by default (fine for 1080p H.264/HEVC; YouTube stops at 1080p). Hardware
+  decoding through the SoC's V4L2 decoder works when the Codec2 V4L2 service built from
+  [tools/v4l2-codec2](tools/v4l2-codec2/README.md) is installed in `lib/v4l2-codec2/`; the build is not
+  part of the release.
 - Netflix and other Widevine L1 apps do not work (uncertified device).
 - Lepton is not used. `wgapps` gives Android its own seccomp profile (everything
   allowed except kernel modules, kexec, clock changes and `open_by_handle_at`;

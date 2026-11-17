@@ -1,0 +1,69 @@
+--- a/plugin_store/Android.bp
++++ b/plugin_store/Android.bp
+@@ -51,3 +51,27 @@
+       "-Wthread-safety",
+     ],
+ }
++
++// The client-side half of the plugin store: installed in the system image so that the MediaCodec in an
++// app can recognise the V4L2 allocator ids (see V4L2ClientPluginStore.cpp).
++cc_library_shared {
++    name: "libc2plugin_store_client",
++    stem: "libc2plugin_store",
++
++    defaults: [
++        "libcodec2-impl-defaults",
++    ],
++
++    srcs: [
++        "V4L2ClientPluginStore.cpp",
++    ],
++    local_include_dirs: [
++        "include",
++    ],
++
++    cflags: [
++        "-Werror",
++        "-Wall",
++        "-Wno-unused-parameter",
++    ],
++}
+--- /dev/null
++++ b/plugin_store/V4L2ClientPluginStore.cpp
+@@ -0,0 +1,36 @@
++// Copyright 2026 The Steam Frame Android project. Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//#define LOG_NDEBUG 0
++#define LOG_TAG "V4L2ClientPluginStore"
++
++#include <C2AllocatorGralloc.h>
++#include <C2Buffer.h>
++
++#include <v4l2_codec2/plugin_store/V4L2AllocatorId.h>
++
++// The V4L2 plugin store as Codec2 *clients* see it: the MediaCodec inside an app (Chrome, Wolvic), which
++// cannot load vendor libraries. Codec2's allocator store asks the plugin whether an allocator id exists
++// before the client names it as a component's output allocator. Without an answer the client falls back
++// to a plain buffer-queue pool and the V4L2 components, which expect their own pool type, crash.
++//
++// The pools themselves are created in the HAL service by the real plugin (libc2plugin_store, the
++// vendor build in this directory), so this library only has to know the ids and gives no pools.
++extern "C" ::C2Allocator* CreateAllocator(::C2Allocator::id_t allocatorId, ::c2_status_t* status) {
++    switch (allocatorId) {
++    case ::android::V4L2AllocatorId::V4L2_BUFFERQUEUE:
++    case ::android::V4L2AllocatorId::V4L2_BUFFERPOOL:
++    case ::android::V4L2AllocatorId::SECURE_LINEAR:
++    case ::android::V4L2AllocatorId::SECURE_GRAPHIC:
++        *status = C2_OK;
++        return new ::android::C2AllocatorGralloc(allocatorId, true);
++    default:
++        *status = C2_BAD_INDEX;
++        return nullptr;
++    }
++}
++
++extern "C" ::C2BlockPool* CreateBlockPool(::C2Allocator::id_t /* allocatorId */,
++                                          ::C2BlockPool::local_id_t /* poolId */) {
++    return nullptr;
++}

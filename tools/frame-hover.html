@@ -1,0 +1,18 @@
+<!doctype html><meta name=viewport content="width=device-width">
+<body style="margin:0;background:#222;color:#fff;font:40px sans-serif">
+<div id=o>hover</div>
+<script>
+// Reports pointer moves and clicks to the server that served this page (see frame-aim-sweep.py).
+let last = 0;
+function rep(t, e) {
+  const n = Date.now();
+  if (t == "m" && n - last < 100) return;
+  last = n;
+  fetch("/" + t + "?x=" + Math.round(e.clientX) + "&y=" + Math.round(e.clientY) +
+        "&w=" + innerWidth + "&h=" + innerHeight).catch(() => {});
+  document.getElementById("o").textContent = t + " " + e.clientX + "," + e.clientY;
+}
+addEventListener("pointermove", e => rep("m", e));
+addEventListener("pointerdown", e => rep("d", e));
+addEventListener("click", e => rep("c", e));
+</script>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spike S4: does an app's VirtualDisplay hand us pixels of another app, and does input sent to that
+     display reach it? Not shipped; installed by hand with `pm install` into a running Android. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="dev.wgapps.quad2d">
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33" />
+    <application android:label="quad2d spike" android:allowBackup="false">
+        <activity android:name=".Quad2dActivity" android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+    </application>
+</manifest>

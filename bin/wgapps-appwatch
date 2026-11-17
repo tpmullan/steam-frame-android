@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Wait until an Android app has no process left.
+
+Runs in the Steam launch of one app (`wgapps steam <package>`) so Steam's "running"
+state follows the app: when the user quits the app inside Android, the Steam entry
+ends. Exits 0 when no process of the package remains (two polls in a row, so a
+process restart is not mistaken for an exit), 1 when the container stops, 2 for a
+bad package name.
+
+Usage: wgapps-appwatch <package> [--interval SECONDS] [--grace POLLS]
+Environment: WGAPPS_CONTAINER (default waydroid-gapps)
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import time
+
+MISSES_TO_END = 2
+PACKAGE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
+
+
+def new_state() -> dict:
+    return {"misses": 0, "polls": 0, "seen": False}
+
+
+def poll(state: dict, result: str, grace: int) -> tuple[dict, int | None]:
+    """One poll result ("up", "down" or "stopped") -> (new state, exit code or None).
+    An app that never shows a process within `grace` polls counts as exited."""
+    if result == "stopped":
+        return state, 1
+    polls = state["polls"] + 1
+    if result == "up":
+        return {"misses": 0, "polls": polls, "seen": True}, None
+    misses = state["misses"] + 1
+    new = {"misses": misses, "polls": polls, "seen": state["seen"]}
+    if misses >= MISSES_TO_END and (state["seen"] or polls >= grace):
+        return new, 0
+    return new, None
+
+
+def probe(container: str, package: str) -> str:
+    """Ask the container: "up" (the package has a process), "down" or "stopped"."""
+    state = subprocess.run(
+        ["podman", "inspect", "-f", "{{.State.Running}}", container],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if state.stdout.strip() != "true":
+        return "stopped"
+    found = subprocess.run(
+        ["podman", "exec", container, "/system/bin/sh", "-c", f"pidof '{package}'"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    return "up" if found.stdout.strip() else "down"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Wait for an Android app to exit")
+    parser.add_argument("package")
+    parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument("--grace", type=int, default=15, help="polls to wait for the app to start")
+    args = parser.parse_args(argv)
+    if not PACKAGE.match(args.package) or len(args.package) > 54:
+        print(f"not a package name: {args.package!r}", file=sys.stderr)
+        return 2
+    container = os.environ.get("WGAPPS_CONTAINER", "waydroid-gapps")
+    state = new_state()
+    while True:
+        try:
+            result = probe(container, args.package)
+        except subprocess.TimeoutExpired:
+            result = "up"  # a slow container is not a gone app
+        state, code = poll(state, result, args.grace)
+        if code is not None:
+            return code
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

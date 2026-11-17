@@ -1,0 +1,26 @@
+--- a/components/V4L2Decoder.cpp
++++ b/components/V4L2Decoder.cpp
+@@ -26,6 +26,8 @@
+ constexpr size_t kNumInputBuffers = 16;
+ // Extra buffers for transmitting in the whole video pipeline.
+ constexpr size_t kNumExtraOutputBuffers = 4;
++// What to assume when the driver has no V4L2_CID_MIN_BUFFERS_FOR_CAPTURE control.
++constexpr size_t kDefaultMinBuffersForCapture = 4;
+ 
+ // Currently we only support flexible pixel 420 format YCBCR_420_888 in Android.
+ // Here is the list of flexible 420 format.
+@@ -666,8 +668,12 @@
+     memset(&ctrl, 0, sizeof(ctrl));
+     ctrl.id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
+     if (mDevice->ioctl(VIDIOC_G_CTRL, &ctrl) != 0) {
+-        ALOGE("ioctl() failed: VIDIOC_G_CTRL");
+-        return std::nullopt;
++        // Not every driver exposes the control (Qualcomm's iris on the Steam Frame answers
++        // EINVAL). Its default is 4, and requesting buffers makes the driver raise a count that
++        // is too low, so carry on with that instead of failing the whole decoder.
++        ALOGW("VIDIOC_G_CTRL(V4L2_CID_MIN_BUFFERS_FOR_CAPTURE) failed; assuming %zu",
++              kDefaultMinBuffersForCapture);
++        ctrl.value = kDefaultMinBuffersForCapture;
+     }
+     ALOGV("%s() V4L2_CID_MIN_BUFFERS_FOR_CAPTURE returns %u", __func__, ctrl.value);
+ 

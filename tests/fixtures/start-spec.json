@@ -1,0 +1,74 @@
+{
+ "windowed": {
+  "name": "waydroid-gapps",
+  "data": "<TMP>/base/data",
+  "share": "<TMP>/base/share",
+  "rundir": "<TMP>/base/run",
+  "rootfs": "<TMP>/base/rootfs",
+  "seccomp": "<TMP>/base/run/android.seccomp.json",
+  "extra_mounts": [],
+  "devices": [
+   "/dev/zero",
+   "/dev/null",
+   "/dev/tty",
+   "/dev/random",
+   "/dev/urandom"
+  ],
+  "char_dev": false,
+  "pulse_socket": null,
+  "wayland_socket": "<TMP>/wayland-1",
+  "net_subnet": "172.20.0",
+  "net_addr": "172.20.0.2",
+  "host_dns": "192.0.2.53",
+  "cgroups": "enabled"
+ },
+ "headless": {
+  "name": "waydroid-gapps",
+  "data": "<TMP>/base/data",
+  "share": "<TMP>/base/share",
+  "rundir": "<TMP>/base/run",
+  "rootfs": "<TMP>/base/rootfs",
+  "seccomp": "<TMP>/base/run/android.seccomp.json",
+  "extra_mounts": [],
+  "devices": [
+   "/dev/zero",
+   "/dev/null",
+   "/dev/tty",
+   "/dev/random",
+   "/dev/urandom"
+  ],
+  "char_dev": false,
+  "pulse_socket": null,
+  "wayland_socket": null,
+  "net_subnet": "172.20.0",
+  "net_addr": "172.20.0.2",
+  "host_dns": "192.0.2.53",
+  "cgroups": "enabled"
+ },
+ "extras": {
+  "name": "waydroid-gapps",
+  "data": "<TMP>/base/data",
+  "share": "<TMP>/base/share",
+  "rundir": "<TMP>/base/run",
+  "rootfs": "<TMP>/base/rootfs",
+  "seccomp": "<TMP>/base/run/android.seccomp.json",
+  "extra_mounts": [
+   "type=bind,source=/dev/null,destination=/vendor/lib64/extra.so,ro",
+   "type=bind,source=/dev/zero,destination=/system/priv-app/Shell/Shell.apk,ro"
+  ],
+  "devices": [
+   "/dev/zero",
+   "/dev/null",
+   "/dev/tty",
+   "/dev/random",
+   "/dev/urandom"
+  ],
+  "char_dev": false,
+  "pulse_socket": null,
+  "wayland_socket": "<TMP>/wayland-1",
+  "net_subnet": "172.20.0",
+  "net_addr": "172.20.0.2",
+  "host_dns": "192.0.2.53",
+  "cgroups": "enabled"
+ }
+}
