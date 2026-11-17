@@ -1886,11 +1886,10 @@ cmd_install() {
 	cmd_prepare --force
 	if [[ "${WGAPPS_SKIP_SHORTCUTS:-0}" == "1" ]]; then
 		log "skipping Steam shortcuts (WGAPPS_SKIP_SHORTCUTS=1)"
-	elif steam_running; then
-		log "Steam is running, so no shortcut was added. With Steam closed, run:"
+	elif ! python3 "$BIN/steam-shortcuts.py" add Android; then
+		# With Steam running this goes through Steam's own client API; Steam need not be closed.
+		log "could not add the Android entry to the Steam library. Try again later, or with Steam closed:"
 		log "  $BIN/steam-shortcuts.py add Android"
-	else
-		python3 "$BIN/steam-shortcuts.py" add Android
 	fi
 	local google="  2. Register this device for Google sign-in: print the GSF ID with
        $BIN/wgapps gsf-id

@@ -290,6 +290,31 @@ class SyncTests(unittest.TestCase):
         self.assertIn("1 added, 0 removed", out)
         self.assertIn("live", out)
 
+    def test_add_while_steam_runs_goes_live_and_is_not_repeated(self):
+        cef = self.start_cef()
+        self.write(sc.entry("Plex", "com.plexapp.android"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sc.main(["steam-shortcuts.py", "add", "Android"])
+        add, name, options = cef.expressions
+        self.assertIn("SteamClient.Apps.AddShortcut(", add)
+        self.assertIn('SetShortcutName(3000000000, "Android")', name)
+        self.assertIn('SetShortcutLaunchOptions(3000000000, "steam")', options)
+        self.assertIn("add (live): Android", out.getvalue())
+        # Steam has written the entry by the time the next call runs: nothing more is sent.
+        self.write(sc.entry("Plex", "com.plexapp.android"), sc.entry("Android", ""))
+        with contextlib.redirect_stdout(out):
+            sc.main(["steam-shortcuts.py", "add", "Android"])
+        self.assertEqual(len(cef.expressions), 3)
+        self.assertIn("already in the Steam library", out.getvalue())
+
+    def test_remove_still_needs_steam_closed(self):
+        self.start_cef()
+        self.write(sc.entry("Android", ""))
+        with self.assertRaises(SystemExit) as raised:
+            sc.main(["steam-shortcuts.py", "remove", "Android"])
+        self.assertIn("Quit Steam first", str(raised.exception))
+
     def test_live_mode_removes_by_the_unsigned_appid_of_our_entry(self):
         cef = self.start_cef()
         gone = sc.entry("Gone", "com.gone.app")

@@ -337,6 +337,26 @@ def cmd_sync(path, catalog_file):
     print(f"sync ({how}): {len(to_add)} added, {len(to_remove)} removed")
 
 
+def cmd_add_live(path, shortcuts, name, package):
+    """`add` while Steam runs: through its own client API, so Steam does not need to be quit."""
+    if any(s.get("AppName") == name for s in shortcuts.values()):
+        print(f"add: {name} is already in the Steam library")
+        return
+    port = int(os.environ.get("WGAPPS_CEF_PORT", "8080"))
+    try:
+        apply_live(shortcuts, [(package, name)], [], port)
+    except ConnectionError as error:
+        sys.exit(f"Steam is running and {error}; quit Steam and run add again")
+    except RuntimeError as error:
+        sys.exit(str(error))
+    deadline = time.monotonic() + SETTLE_SECONDS
+    while time.monotonic() < deadline:  # Steam writes shortcuts.vdf a few seconds later
+        if any(s.get("AppName") == name for s in load(path).values()):
+            break
+        time.sleep(0.5)
+    print(f"add (live): {name}")
+
+
 def main(argv):
     if len(argv) < 2 or argv[1] not in ("list", "add", "add-exec", "remove", "sync"):
         sys.exit(__doc__)
@@ -351,6 +371,8 @@ def main(argv):
             print(f"{s.get('AppName')}\t{s.get('Exe')} {s.get('LaunchOptions', '')}")
         return
     if steam_running():
+        if argv[1] == "add":
+            return cmd_add_live(path, shortcuts, argv[2], argv[3] if len(argv) > 3 else "")
         sys.exit("Steam is running; it would overwrite shortcuts.vdf. Quit Steam first.")
     name = argv[2]
     kept = {
